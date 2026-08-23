@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "struct-xai-platform"
+version = "0.2.0"
+description = "Compact layer-wise interpretability toolkit and experiment service for causal LMs"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116",
+  "pydantic>=2.11",
+  "torch>=2.2",
+  "transformers>=4.50",
+  "uvicorn[standard]>=0.35",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.12"]
+
+[project.scripts]
+struct-xai = "structxai.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["structxai*", "cloud_service*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
