@@ -11,6 +11,63 @@ def _bar(value: float, scale: float) -> str:
     return f'<div class="bar-track"><div class="bar {direction}" style="width:{width:.1f}%"></div></div>'
 
 
+def _evaluation_cards(payload: dict) -> str:
+    evaluation = payload.get("evaluation")
+    if not isinstance(evaluation, dict):
+        return ""
+
+    cards: list[str] = []
+    for pair in evaluation.get("pairs", []):
+        positive = html.escape(str(pair["positive"]))
+        negative = html.escape(str(pair["negative"]))
+        baseline = pair["baseline"]
+        interventions = pair.get("interventions", {})
+        if not interventions:
+            cards.append(
+                '<article class="card">'
+                f"<h3>{positive} vs {negative}</h3>"
+                f"<p>Final base margin: <code>{baseline['final_margin']:.4f}</code></p>"
+                "</article>"
+            )
+            continue
+
+        for name, metrics in interventions.items():
+            cards.append(
+                '<article class="card">'
+                f"<h3>{positive} vs {negative} · {html.escape(str(name))}</h3>"
+                f"<p>Mean |Δ margin|: <code>{metrics['mean_abs_margin_delta']:.4f}</code><br>"
+                f"Final Δ margin: <code>{metrics['final_margin_delta']:.4f}</code><br>"
+                f"Peak effect: layer <code>{metrics['peak_effect_layer']}</code> "
+                f"(|Δ|={metrics['max_abs_margin_delta']:.4f})<br>"
+                "Final pairwise winner changed: "
+                f"<code>{metrics['pairwise_winner_changed_at_final_layer']}</code></p>"
+                "</article>"
+            )
+    return "".join(cards)
+
+
+def _provenance_card(payload: dict) -> str:
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        return ""
+    runtime = provenance.get("runtime", {})
+    fingerprint = html.escape(str(provenance.get("experiment_fingerprint", "unknown")))
+    resolved_device = html.escape(str(provenance.get("resolved_device", "unknown")))
+    dtype = html.escape(str(provenance.get("dtype", "unknown")))
+    versions = html.escape(
+        f"torch={runtime.get('torch')} · transformers={runtime.get('transformers')} · "
+        f"python={runtime.get('python')}"
+    )
+    return (
+        '<article class="card">'
+        "<h3>Reproducibility</h3>"
+        f"<p>Fingerprint: <code>{fingerprint}</code><br>"
+        f"Runtime: <code>{resolved_device} / {dtype}</code><br>"
+        f"{versions}</p>"
+        "</article>"
+    )
+
+
 def render_report(payload: dict, output: str | Path) -> Path:
     base_layers = payload["base"]["layers"]
     all_scores = [abs(layer["margin"]) for layer in base_layers] or [1.0]
@@ -36,6 +93,15 @@ def render_report(payload: dict, output: str | Path) -> Path:
             f"<p><strong>Prompt:</strong> {html.escape(variant['prompt'])}</p>"
             f"<p><strong>Sign flips:</strong> {html.escape(json.dumps(flips))}</p>"
             "</article>"
+        )
+
+    provenance_card = _provenance_card(payload)
+    evaluation_cards = _evaluation_cards(payload)
+    evaluation_section = ""
+    if evaluation_cards:
+        evaluation_section = (
+            "<h2>Quantitative intervention evaluation</h2>"
+            f'<div class="grid">{evaluation_cards}</div>'
         )
 
     document = f"""<!doctype html>
@@ -70,11 +136,13 @@ Metric: <code>{html.escape(payload['base']['metric'])}</code></p>
 <article class="card"><h3>Prompt</h3><p>{html.escape(payload['experiment']['prompt'])}</p></article>
 <article class="card"><h3>Candidates</h3><p>{html.escape(' · '.join(payload['experiment']['candidates']))}</p></article>
 <article class="card"><h3>Base sign flips</h3><p>{html.escape(json.dumps(payload['base'].get('sign_flips', [])))}</p></article>
+{provenance_card}
 </div>
 <h2>Layer-wise candidate margin</h2>
 <table><thead><tr><th>Layer</th><th>Winner</th><th>Margin</th><th>Magnitude</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
 <h2>Interventions</h2>
 <div class="grid">{''.join(variant_cards) or '<article class="card">No intervention variants.</article>'}</div>
+{evaluation_section}
 </main></body></html>"""
 
     path = Path(output)
