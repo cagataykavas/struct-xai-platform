@@ -13,14 +13,22 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -e '.[dev]'
-      - run: ruff check structxai cloud_service tests
-      - run: pytest -q
-      - run: struct-xai --help
-      - run: python -c "from cloud_service.api import health; assert health()['status'] == 'ok'"
+      - name: Install CPU PyTorch
+        run: pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
+      - name: Install project and dev dependencies
+        run: pip install -e '.[dev]'
+      - name: Ruff
+        run: ruff check structxai cloud_service tests
+      - name: Pytest
+        run: pytest -q
+      - name: CLI smoke test
+        run: struct-xai --help
+      - name: Service health smoke test
+        run: python -c "from cloud_service.api import health; assert health()['status'] == 'ok'"
 
   container:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t struct-xai:ci .
+      - name: Build CPU service image
+        run: docker build -t struct-xai:ci .
