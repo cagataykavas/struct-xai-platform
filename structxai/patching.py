@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
