@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +44,7 @@ class ExperimentStore:
         return con
 
     def create(self, experiment_id: str, request: dict[str, Any]) -> ExperimentRecord:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         with self._connect() as con:
             con.execute(
                 "INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -60,7 +60,7 @@ class ExperimentStore:
         artifact_path: str | None = None,
         error: str | None = None,
     ) -> ExperimentRecord:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         with self._connect() as con:
             con.execute(
                 """
