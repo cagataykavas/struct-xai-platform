@@ -71,7 +71,7 @@ def _run(experiment_id: str, request: ExperimentRequest) -> None:
             status="completed",
             artifact_path=str(report_path),
         )
-    except Exception as exc:
+    except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         STORE.update(experiment_id, status="failed", error=f"{type(exc).__name__}: {exc}")
 
 
