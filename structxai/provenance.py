@@ -5,11 +5,15 @@ import json
 import os
 import platform
 import sys
-from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any
+from typing import Any, Protocol
 
-from structxai.experiment import ExperimentSpec
+
+class ExperimentSpecLike(Protocol):
+    name: str
+    prompt: str
+    candidates: tuple[str, ...]
+    model_name: str
 
 
 def _sha256_json(payload: object) -> str:
@@ -29,11 +33,25 @@ def _package_version(name: str) -> str | None:
         return None
 
 
-def experiment_fingerprint(spec: ExperimentSpec) -> str:
-    return _sha256_json(asdict(spec))
+def _spec_payload(spec: ExperimentSpecLike) -> dict[str, object]:
+    return {
+        "name": spec.name,
+        "prompt": spec.prompt,
+        "candidates": list(spec.candidates),
+        "model_name": spec.model_name,
+    }
 
 
-def build_provenance(spec: ExperimentSpec, base: dict, *, requested_device: str | None) -> dict[str, Any]:
+def experiment_fingerprint(spec: ExperimentSpecLike) -> str:
+    return _sha256_json(_spec_payload(spec))
+
+
+def build_provenance(
+    spec: ExperimentSpecLike,
+    base: dict,
+    *,
+    requested_device: str | None,
+) -> dict[str, Any]:
     return {
         "schema": "struct-xai-experiment/v1",
         "experiment_fingerprint": experiment_fingerprint(spec),
@@ -75,25 +93,31 @@ def validate_artifact(payload: dict) -> dict[str, object]:
         return {"valid": False, "errors": errors}
 
     try:
-        spec = ExperimentSpec(
-            name=str(experiment["name"]),
-            prompt=str(experiment["prompt"]),
-            candidates=tuple(str(item) for item in experiment["candidates"]),
-            model_name=str(experiment["model_name"]),
-        )
+        name = str(experiment["name"])
+        prompt = str(experiment["prompt"])
+        candidates = tuple(str(item) for item in experiment["candidates"])
+        model_name = str(experiment["model_name"])
     except (KeyError, TypeError) as exc:
         errors.append(f"invalid_experiment:{type(exc).__name__}")
         return {"valid": False, "errors": errors}
 
-    if provenance.get("experiment_fingerprint") != experiment_fingerprint(spec):
+    expected_fingerprint = _sha256_json(
+        {
+            "name": name,
+            "prompt": prompt,
+            "candidates": list(candidates),
+            "model_name": model_name,
+        }
+    )
+    if provenance.get("experiment_fingerprint") != expected_fingerprint:
         errors.append("experiment_fingerprint_mismatch")
-    if provenance.get("prompt_sha256") != hashlib.sha256(spec.prompt.encode("utf-8")).hexdigest():
+    if provenance.get("prompt_sha256") != hashlib.sha256(prompt.encode("utf-8")).hexdigest():
         errors.append("prompt_hash_mismatch")
-    if provenance.get("candidates_sha256") != _sha256_json(list(spec.candidates)):
+    if provenance.get("candidates_sha256") != _sha256_json(list(candidates)):
         errors.append("candidate_hash_mismatch")
-    if base.get("prompt") != spec.prompt:
+    if base.get("prompt") != prompt:
         errors.append("base_prompt_mismatch")
-    if base.get("model") != spec.model_name:
+    if base.get("model") != model_name:
         errors.append("base_model_mismatch")
 
     base_layers = base.get("layers")
@@ -102,20 +126,20 @@ def validate_artifact(payload: dict) -> dict[str, object]:
         return {"valid": not errors, "errors": errors}
 
     base_indices = [row.get("layer") for row in base_layers if isinstance(row, dict)]
-    for name, variant_payload in variants.items():
+    for variant_name, variant_payload in variants.items():
         analysis = variant_payload.get("analysis") if isinstance(variant_payload, dict) else None
         if not isinstance(analysis, dict):
-            errors.append(f"variant_analysis_missing:{name}")
+            errors.append(f"variant_analysis_missing:{variant_name}")
             continue
-        if analysis.get("model") != spec.model_name:
-            errors.append(f"variant_model_mismatch:{name}")
+        if analysis.get("model") != model_name:
+            errors.append(f"variant_model_mismatch:{variant_name}")
         variant_layers = analysis.get("layers")
         if not isinstance(variant_layers, list):
-            errors.append(f"variant_layers_missing:{name}")
+            errors.append(f"variant_layers_missing:{variant_name}")
             continue
         variant_indices = [row.get("layer") for row in variant_layers if isinstance(row, dict)]
         if variant_indices != base_indices:
-            errors.append(f"variant_layer_alignment_mismatch:{name}")
+            errors.append(f"variant_layer_alignment_mismatch:{variant_name}")
 
     return {
         "valid": not errors,
