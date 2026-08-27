@@ -8,7 +8,8 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY structxai ./structxai
 COPY cloud_service ./cloud_service
-RUN pip install --no-cache-dir . \
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch>=2.2" \
+    && pip install --no-cache-dir . \
     && useradd --create-home --uid 10001 appuser \
     && mkdir -p /app/artifacts /tmp/huggingface \
     && chown -R appuser:appuser /app /tmp/huggingface
