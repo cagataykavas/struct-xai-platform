@@ -64,6 +64,8 @@ def run_layerwise(
         "prompt": prompt,
         "candidates": [asdict(candidate) for candidate in candidates],
         "metric": "first_token_candidate_logit_margin",
+        "device": resolved_device,
+        "dtype": str(dtype).removeprefix("torch."),
         "layers": serialize_decisions(decisions),
     }
     if len(candidates) == 2:
