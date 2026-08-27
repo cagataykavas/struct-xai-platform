@@ -6,8 +6,10 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from structxai.evaluation import evaluate_interventions
 from structxai.hf_runner import run_layerwise
 from structxai.interventions import Intervention
+from structxai.provenance import build_provenance
 
 
 @dataclass(frozen=True)
@@ -42,8 +44,10 @@ def compare_interventions(
     payload = {
         "experiment": asdict(spec),
         "created_at": datetime.now(UTC).isoformat(),
+        "provenance": build_provenance(spec, base, requested_device=device),
         "base": base,
         "variants": variants,
+        "evaluation": evaluate_interventions(base, variants, spec.candidates),
     }
 
     out = Path(output_dir)
@@ -56,7 +60,7 @@ def compare_interventions(
 
 def layer_margin_delta(base: dict, variant: dict, positive: str, negative: str) -> list[dict]:
     rows: list[dict] = []
-    for base_layer, variant_layer in zip(base["layers"], variant["layers"]):
+    for base_layer, variant_layer in zip(base["layers"], variant["layers"], strict=True):
         base_margin = base_layer["candidate_scores"][positive] - base_layer["candidate_scores"][negative]
         variant_margin = variant_layer["candidate_scores"][positive] - variant_layer["candidate_scores"][negative]
         rows.append(
