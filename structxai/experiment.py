@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Sequence
 
 from structxai.hf_runner import run_layerwise
 from structxai.interventions import Intervention
@@ -41,7 +41,7 @@ def compare_interventions(
 
     payload = {
         "experiment": asdict(spec),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
         "base": base,
         "variants": variants,
     }
