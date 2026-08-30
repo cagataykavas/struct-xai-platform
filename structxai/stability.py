@@ -117,7 +117,7 @@ def compare_artifacts(left: dict, right: dict) -> dict[str, object]:
     left_experiment = left.get("experiment")
     right_experiment = right.get("experiment")
     if not isinstance(left_experiment, dict) or not isinstance(right_experiment, dict):
-        raise ValueError("both artifacts must contain experiment metadata")
+        raise TypeError("both artifacts must contain experiment metadata dictionaries")
 
     identity_fields = ("prompt", "candidates", "model_name")
     mismatches = [
