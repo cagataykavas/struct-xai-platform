@@ -10,6 +10,7 @@ from structxai.interventions import delete_literal, replace_literal
 from structxai.patching import patch_final_position, serialize_patch
 from structxai.provenance import validate_artifact
 from structxai.report import render_report
+from structxai.stability import compare_artifacts
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,10 +47,28 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output", type=Path)
     evaluate.add_argument("--fail-invalid", action="store_true")
 
+    stability = sub.add_parser(
+        "stability",
+        help="compare two repeated runs of the same experiment offline",
+    )
+    stability.add_argument("left", type=Path)
+    stability.add_argument("right", type=Path)
+    stability.add_argument("--output", type=Path)
+
     report = sub.add_parser("report", help="render an experiment JSON artifact as standalone HTML")
     report.add_argument("artifact", type=Path)
     report.add_argument("--output", type=Path)
     return parser
+
+
+def _write_or_print(payload: object, output: Path | None) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(text, encoding="utf-8")
+        print(output)
+    else:
+        print(text)
 
 
 def main() -> int:
@@ -81,20 +100,24 @@ def main() -> int:
         print(json.dumps(serialize_patch(result), indent=2))
         return 0
 
+    if args.command == "stability":
+        left = json.loads(args.left.read_text(encoding="utf-8"))
+        right = json.loads(args.right.read_text(encoding="utf-8"))
+        _write_or_print(compare_artifacts(left, right), args.output)
+        return 0
+
     payload = json.loads(args.artifact.read_text(encoding="utf-8"))
     if args.command == "evaluate":
         candidates = tuple(str(item) for item in payload["experiment"]["candidates"])
         result = {
             "validation": validate_artifact(payload),
-            "evaluation": evaluate_interventions(payload["base"], payload.get("variants", {}), candidates),
+            "evaluation": evaluate_interventions(
+                payload["base"],
+                payload.get("variants", {}),
+                candidates,
+            ),
         }
-        text = json.dumps(result, ensure_ascii=False, indent=2)
-        if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(text, encoding="utf-8")
-            print(args.output)
-        else:
-            print(text)
+        _write_or_print(result, args.output)
         if args.fail_invalid and not result["validation"]["valid"]:
             return 2
         return 0
