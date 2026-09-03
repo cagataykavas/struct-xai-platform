@@ -18,13 +18,27 @@ jobs:
       - name: Install project and dev dependencies
         run: pip install -e '.[dev]'
       - name: Ruff
-        run: ruff check structxai cloud_service tests
+        run: ruff check structxai cloud_service tests examples
       - name: Pytest
         run: pytest -q
       - name: CLI smoke test
         run: struct-xai --help
       - name: Service health smoke test
         run: python -c "from cloud_service.api import health; assert health()['status'] == 'ok'"
+      - name: Synthetic reproducibility evidence
+        run: |
+          python examples/synthetic_reproducibility_report.py \
+            --json artifacts/reproducibility_evidence.json \
+            --markdown artifacts/reproducibility_evidence.md \
+            > /tmp/reproducibility-evidence.stdout.json
+      - name: Publish research evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: struct-xai-reproducibility-evidence
+          path: |
+            artifacts/reproducibility_evidence.json
+            artifacts/reproducibility_evidence.md
+          if-no-files-found: error
 
   container:
     runs-on: ubuntu-latest
