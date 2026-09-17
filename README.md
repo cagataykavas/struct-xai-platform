@@ -25,7 +25,7 @@ That separation is reflected directly in the codebase.
 | Layer-wise analysis | final-position hidden-state projection, candidate-aware scores, winner/runner-up trace |
 | Decision dynamics | signed candidate margins, sign-flip detection, peak effect layer |
 | Prompt interventions | reproducible literal deletion and replacement |
-| Causal intervention | single-layer final-position activation patching with forward hooks |
+| Causal intervention | final-position activation patching plus model-free layer-sweep evaluation |
 | Quantitative evaluation | mean/max margin shift, final winner change, sign-flip count, intervention sensitivity |
 | Repeatability | cross-run Pearson correlation, sign agreement, absolute margin drift, final-winner agreement |
 | Provenance | experiment fingerprint, prompt/candidate SHA-256, model, metric, device/dtype, runtime versions, source revision |
@@ -173,6 +173,27 @@ The public patching experiment is intentionally narrow and inspectable. It captu
 
 This is implemented with real forward hooks; it is not a static diagram standing in for activation patching.
 
+### Evaluate an activation-patching sweep
+
+Saved `serialize_patch` results from multiple layers can be summarized without loading the model again:
+
+```python
+from structxai.patch_sweep import summarize_patch_sweep
+
+summary = summarize_patch_sweep(records, " Ankara", " Athens")
+print(summary.to_dict())
+```
+
+The evaluator validates that every result uses a unique layer and the same unpatched baseline margin. It then reports:
+
+- signed and absolute candidate-margin effect for every patched layer;
+- peak causal-effect layer and mean absolute effect;
+- effect concentration, measuring how much total absolute effect is localized at the peak;
+- direction consistency across layers;
+- layers where patching reverses the pairwise winner.
+
+This is a causal-effect profile of the chosen activation intervention. It does not claim that a concentrated patch effect is a complete mechanistic explanation.
+
 ## Experiment artifact and provenance
 
 A JSON artifact contains:
@@ -245,6 +266,7 @@ structxai/
   hf_runner.py       Hugging Face model adapter
   interventions.py   controlled prompt mutations
   patching.py        activation patching
+  patch_sweep.py     model-free layer-sweep effect metrics
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation
@@ -264,7 +286,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - candidate scoring and margins;
 - sign-flip detection;
 - deletion/replacement interventions;
-- quantitative intervention evaluation;
+- quantitative intervention and activation-patch sweep evaluation;
 - provenance validation;
 - cross-run stability metrics;
 - HTML report generation;
@@ -292,7 +314,7 @@ Next research-oriented extensions include:
 - full candidate sequence log-probability scoring;
 - candidate-aware gradient/span attribution;
 - token × layer heatmaps;
-- activation-patching sweeps over layer × token position;
+- activation-patching sweeps over token positions;
 - clean/corrupted causal tracing;
 - multi-model comparison matrices;
 - compact Turkish instruction-model benchmark suites;
