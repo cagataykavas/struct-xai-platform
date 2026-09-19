@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 
 
 @dataclass(frozen=True)
@@ -97,7 +98,7 @@ def evaluate_deletion_curve(
 
     monotonic_transitions = sum(
         right.candidate_margin <= left.candidate_margin + recovery_tolerance
-        for left, right in zip(curve, curve[1:], strict=True)
+        for left, right in pairwise(curve)
     )
     monotonicity = monotonic_transitions / (len(curve) - 1)
     flip_fraction = next(
