@@ -159,7 +159,39 @@ final pairwise winner agreement
 
 These metrics quantify **repeatability of the measured decision trace**. A high correlation is not claimed to prove causal faithfulness; faithfulness and repeatability are kept as separate concepts.
 
-## 5. Activation patching
+## 5. Audit attribution faithfulness with deletion curves
+
+A ranked explanation should have measurable behavioral consequences. `evaluate_deletion_curve`
+checks whether progressively removing the most-attributed evidence suppresses the selected
+candidate-vs-foil margin:
+
+```python
+from structxai.faithfulness import DeletionStep, evaluate_deletion_curve
+
+report = evaluate_deletion_curve(
+    [
+        DeletionStep(0.0, 4.0),
+        DeletionStep(0.25, 3.1),
+        DeletionStep(0.50, 1.8),
+        DeletionStep(1.0, -0.4),
+    ],
+    minimum_aopc=1.5,
+    minimum_monotonicity=0.8,
+)
+```
+
+The JSON-ready report includes trapezoidal area over the perturbation curve (AOPC), monotonicity,
+final and peak margin drops, the first winner-flip fraction, and machine-readable gate reasons.
+Unequal deletion schedules are supported; malformed, unordered and non-finite curves fail closed.
+A configurable recovery tolerance prevents tiny floating-point movement from becoming a false
+monotonicity failure.
+
+This evaluator consumes already-computed candidate margins and does not run the language model.
+Deletion can create out-of-distribution prompts, AOPC depends on the perturbation policy, and a
+monotonic curve does not prove a complete causal explanation. Results should be compared against
+random or inverse-attribution deletion baselines and reported together with prompt provenance.
+
+## 6. Activation patching
 
 ```bash
 struct-xai patch \
