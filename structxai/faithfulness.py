@@ -85,11 +85,9 @@ def evaluate_deletion_curve(
     baseline_margin = curve[0].candidate_margin
     drops = [baseline_margin - step.candidate_margin for step in curve]
     area = 0.0
-    for left, right, left_drop, right_drop in zip(
-        curve,
-        curve[1:],
-        drops,
-        drops[1:],
+    for (left, right), (left_drop, right_drop) in zip(
+        pairwise(curve),
+        pairwise(drops),
         strict=True,
     ):
         width = right.removed_fraction - left.removed_fraction
