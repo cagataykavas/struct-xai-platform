@@ -28,6 +28,7 @@ That separation is reflected directly in the codebase.
 | Causal intervention | single-layer final-position activation patching with forward hooks |
 | Quantitative evaluation | mean/max margin shift, final winner change, sign-flip count, intervention sensitivity |
 | Repeatability | cross-run Pearson correlation, sign agreement, absolute margin drift, final-winner agreement |
+| Model sensitivity | progressive parameter-randomization sanity gate for attribution vectors |
 | Provenance | experiment fingerprint, prompt/candidate SHA-256, model, metric, device/dtype, runtime versions, source revision |
 | Artifact validation | prompt/model/fingerprint checks and base-vs-variant layer alignment |
 | Outputs | JSON experiment artifacts and standalone HTML reports |
@@ -173,6 +174,25 @@ The public patching experiment is intentionally narrow and inspectable. It captu
 
 This is implemented with real forward hooks; it is not a static diagram standing in for activation patching.
 
+## 6. Audit attribution sensitivity to model parameters
+
+An explanation can be stable and visually plausible while remaining almost unchanged after the
+model is randomized. `structxai.randomization` evaluates attribution artifacts from progressively
+randomized checkpoints:
+
+- absolute cosine similarity, so a simple sign inversion cannot masquerade as independence;
+- top-K feature overlap and sign agreement on the baseline's most important features;
+- minimum case/stage evidence and final randomized-fraction coverage;
+- detection of suspicious similarity recovery at later randomization stages;
+- deterministic case-level JSON evidence and fail-closed input validation.
+
+Run `python -m structxai.randomization artifact.json --require-pass` in an experiment pipeline.
+Exit code `0` accepts the evidence, `2` is a valid policy rejection and `1` identifies malformed
+input. The artifact generator must record the randomization order, seed, checkpoint identity and
+attribution configuration. Passing this check demonstrates model sensitivity, not causal
+faithfulness or explanation correctness; thresholds must be calibrated against random, input-only
+and task-relevant controls.
+
 ## Experiment artifact and provenance
 
 A JSON artifact contains:
@@ -247,6 +267,7 @@ structxai/
   patching.py        activation patching
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
+  randomization.py   attribution parameter-randomization sanity gate
   provenance.py      fingerprints and artifact validation
   experiment.py      experiment orchestration
   report.py          standalone HTML reporting
@@ -283,6 +304,7 @@ The repository tries to make its limitations visible:
 - deletion/replacement effects can be confounded by distribution shift;
 - activation patching is currently limited to one layer and the final sequence position;
 - cross-run stability measures repeatability, not truth;
+- parameter-randomization sensitivity is necessary evidence, not proof of causal faithfulness;
 - a visually clean heatmap is not treated as evidence without an explicit metric and experiment identity.
 
 ## Research directions
