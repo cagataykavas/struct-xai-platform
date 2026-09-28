@@ -7,6 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from structxai.core import Candidate, find_sign_flips, layerwise_decisions, serialize_decisions
+from structxai.sequence_scoring import score_candidate_sequences
 
 
 def resolve_projection(model):
@@ -58,6 +59,12 @@ def run_layerwise(
     candidates = encode_candidates(tokenizer, candidate_labels)
     projected = project_hidden_states(model, outputs.hidden_states)
     decisions = layerwise_decisions(projected, candidates)
+    sequence_scoring = score_candidate_sequences(
+        model,
+        encoded["input_ids"],
+        candidates,
+        prompt_attention_mask=encoded.get("attention_mask"),
+    )
 
     result = {
         "model": model_name,
@@ -67,6 +74,7 @@ def run_layerwise(
         "device": resolved_device,
         "dtype": str(dtype).removeprefix("torch."),
         "layers": serialize_decisions(decisions),
+        "final_candidate_sequence_scoring": sequence_scoring,
     }
     if len(candidates) == 2:
         result["sign_flips"] = [
