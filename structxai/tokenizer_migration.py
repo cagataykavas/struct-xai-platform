@@ -60,7 +60,7 @@ class TokenizerMigrationPolicy:
         for name in unit:
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or isinstance(value, bool):
-                raise ValueError(f"policy {name} must be numeric")
+                raise TypeError(f"policy {name} must be numeric")
             if not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
                 raise ValueError(f"policy {name} must be within [0, 1]")
         positive_float = (
@@ -72,7 +72,7 @@ class TokenizerMigrationPolicy:
         for name in positive_float:
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or isinstance(value, bool):
-                raise ValueError(f"policy {name} must be numeric")
+                raise TypeError(f"policy {name} must be numeric")
             if not math.isfinite(float(value)) or float(value) < 0.0:
                 raise ValueError(f"policy {name} must be finite and non-negative")
         positive_int = (
@@ -244,7 +244,7 @@ def _timestamp(value: Any, context: str) -> datetime:
     if not isinstance(value, str) or not value.endswith("Z"):
         raise MalformedArtifact(f"{context} must be an RFC3339 UTC timestamp")
     try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise MalformedArtifact(f"{context} is not a valid timestamp") from exc
     return parsed.astimezone(UTC)
@@ -529,7 +529,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sys.stdout.buffer.write(payload)
         return 0 if report["accepted"] else 2
-    except (MalformedArtifact, ValueError) as exc:
+    except (MalformedArtifact, TypeError, ValueError) as exc:
         error = {
             "schema_version": REPORT_SCHEMA,
             "accepted": False,
