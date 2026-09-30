@@ -393,7 +393,7 @@ def _timestamp(value: Any, field: str) -> datetime:
     if not isinstance(value, str):
         raise EvidenceError(f"{field} must be an ISO-8601 string")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError as error:
         raise EvidenceError(f"{field} is not valid ISO-8601") from error
     if parsed.tzinfo is None or parsed.utcoffset() is None:
