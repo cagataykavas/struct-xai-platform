@@ -19,11 +19,19 @@ Run the audit before interpreting a deletion or occlusion curve:
 ```bash
 python -m structxai.perturbation_integrity \
   --input artifacts/token-perturbations.json \
-  --output artifacts/token-perturbation-audit.json
+  --output artifacts/token-perturbation-audit.json \
+  --expected-model-id Qwen-0.5B \
+  --expected-model-revision "$MODEL_COMMIT" \
+  --expected-tokenizer-id Qwen-tokenizer \
+  --expected-tokenizer-revision "$TOKENIZER_COMMIT" \
+  --expected-policy-id perturbation-policy-v1 \
+  --expected-prompt-sha256 "$PROMPT_SHA256"
 ```
 
 Exit code `0` means accepted, `2` means structurally valid evidence violated policy, and `3` means the evidence was malformed or could not be read safely. Reports contain deterministic reason codes, aggregate counts, hashed experiment/variant references and canonical SHA-256 identities; they do not repeat input token IDs or replacement tokens.
 
+The six `--expected-*` arguments form one execution lock and must be supplied together. A mismatch in the model ID, model revision, tokenizer ID, tokenizer revision, perturbation policy ID or prompt digest rejects the artifact with a stable `IDENTITY001`–`IDENTITY006` reason code. The report stores only the lock's canonical SHA-256 digest, so independent promotion gates can compare the configured contract without copying those identifiers into every report.
+
 ## Trust boundary
 
-The artifact producer must capture tensors from the actual model call and bind the correct model, tokenizer revision and prompt digest. SHA-256 supplies content identity, not producer authenticity. The audit proves that the supplied token sequences obey their declared perturbation contract; it does not prove that the perturbation is in-distribution, semantically neutral, causally sufficient, fair, or representative. Production promotion should sign the report and combine it with random/inverse controls, behavioral faithfulness metrics and provenance-locked model execution.
+The artifact producer must capture tensors from the actual model call. The execution lock proves that the producer declared the expected identities, not that it used them, and SHA-256 supplies content identity rather than producer authenticity. The audit proves that the supplied token sequences obey their declared perturbation contract; it does not prove that the perturbation is in-distribution, semantically neutral, causally sufficient, fair, or representative. Production promotion should sign the report and combine it with random/inverse controls, behavioral faithfulness metrics and provenance-locked model execution.

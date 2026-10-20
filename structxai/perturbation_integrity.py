@@ -46,6 +46,30 @@ class AuditPolicy:
 
 
 @dataclass(frozen=True)
+class ExecutionIdentity:
+    """Expected immutable identity for the model execution under audit."""
+
+    model_id: str
+    model_revision: str
+    tokenizer_id: str
+    tokenizer_revision: str
+    policy_id: str
+    prompt_sha256: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.model_id, "expected model_id")
+        _revision(self.model_revision, "expected model_revision")
+        _identifier(self.tokenizer_id, "expected tokenizer_id")
+        _revision(self.tokenizer_revision, "expected tokenizer_revision")
+        _identifier(self.policy_id, "expected policy_id")
+        if DIGEST.fullmatch(self.prompt_sha256) is None:
+            raise ValueError("expected prompt_sha256 must be lowercase SHA-256")
+
+    def canonical_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class TokenSequence:
     input_ids: tuple[int, ...]
     attention_mask: tuple[int, ...]
@@ -224,6 +248,7 @@ def audit_artifact(
     artifact: PerturbationArtifact,
     policy: AuditPolicy | None = None,
     *,
+    expected_identity: ExecutionIdentity | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     policy = policy or AuditPolicy()
@@ -233,6 +258,33 @@ def audit_artifact(
         raise EvidenceError("evaluation time must include a timezone")
     evaluated_at = evaluated_source.astimezone(UTC)
     findings: list[Finding] = []
+    if expected_identity is not None:
+        identity_checks = (
+            (artifact.model_id, expected_identity.model_id, "IDENTITY001", "model ID"),
+            (
+                artifact.model_revision,
+                expected_identity.model_revision,
+                "IDENTITY002",
+                "model revision",
+            ),
+            (artifact.tokenizer_id, expected_identity.tokenizer_id, "IDENTITY003", "tokenizer ID"),
+            (
+                artifact.tokenizer_revision,
+                expected_identity.tokenizer_revision,
+                "IDENTITY004",
+                "tokenizer revision",
+            ),
+            (artifact.policy_id, expected_identity.policy_id, "IDENTITY005", "policy ID"),
+            (
+                artifact.prompt_sha256,
+                expected_identity.prompt_sha256,
+                "IDENTITY006",
+                "prompt digest",
+            ),
+        )
+        for actual, expected, code, field in identity_checks:
+            if actual != expected:
+                findings.append(Finding(code, f"artifact {field} does not match the execution lock"))
     age = evaluated_at - artifact.generated_at
     future_limit = timedelta(seconds=policy.max_future_skew_seconds)
     if age < -future_limit:
@@ -315,6 +367,9 @@ def audit_artifact(
         "evaluated_at": _iso(evaluated_at),
         "experiment_ref": _reference(artifact.experiment_id),
         "artifact_sha256": artifact_sha,
+        "execution_lock_sha256": (
+            None if expected_identity is None else _sha256(expected_identity.canonical_dict())
+        ),
         "policy": asdict(policy),
         "metrics": {
             "variants": len(artifact.variants),
@@ -467,16 +522,41 @@ def _atomic_write(path: Path, values: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _execution_lock(values: argparse.Namespace) -> ExecutionIdentity | None:
+    names = (
+        "expected_model_id",
+        "expected_model_revision",
+        "expected_tokenizer_id",
+        "expected_tokenizer_revision",
+        "expected_policy_id",
+        "expected_prompt_sha256",
+    )
+    supplied = [getattr(values, name) is not None for name in names]
+    if any(supplied) and not all(supplied):
+        raise EvidenceError("all six expected execution identity fields must be supplied together")
+    if not any(supplied):
+        return None
+    return ExecutionIdentity(*(getattr(values, name) for name in names))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Audit token-level perturbation integrity")
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--max-evidence-age-seconds", type=int, default=3600)
     parser.add_argument("--max-future-skew-seconds", type=int, default=30)
+    parser.add_argument("--expected-model-id")
+    parser.add_argument("--expected-model-revision")
+    parser.add_argument("--expected-tokenizer-id")
+    parser.add_argument("--expected-tokenizer-revision")
+    parser.add_argument("--expected-policy-id")
+    parser.add_argument("--expected-prompt-sha256")
     values = parser.parse_args(argv)
     try:
         policy = AuditPolicy(values.max_evidence_age_seconds, values.max_future_skew_seconds)
-        report = audit_artifact(load_artifact(values.input), policy)
+        report = audit_artifact(
+            load_artifact(values.input), policy, expected_identity=_execution_lock(values)
+        )
         _atomic_write(values.output, report)
     except (EvidenceError, OSError, TypeError, ValueError) as error:
         print(json.dumps({"status": "malformed", "error": str(error)}))

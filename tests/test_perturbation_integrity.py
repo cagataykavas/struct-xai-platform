@@ -11,6 +11,7 @@ from structxai.perturbation_integrity import (
     MAX_INPUT_BYTES,
     AuditPolicy,
     EvidenceError,
+    ExecutionIdentity,
     PerturbationArtifact,
     audit_artifact,
     load_artifact,
@@ -76,6 +77,19 @@ def _artifact(**changes) -> PerturbationArtifact:
         changes["generated_at"] = changes["generated_at"].isoformat()
     values.update(changes)
     return PerturbationArtifact.from_dict(values)
+
+
+def _identity(**changes: str) -> ExecutionIdentity:
+    values = {
+        "model_id": "Qwen-0.5B",
+        "model_revision": "b" * 40,
+        "tokenizer_id": "Qwen-tokenizer",
+        "tokenizer_revision": "c" * 40,
+        "policy_id": "perturbation-policy-v1",
+        "prompt_sha256": "a" * 64,
+    }
+    values.update(changes)
+    return ExecutionIdentity(**values)
 
 
 def _codes(report: dict) -> set[str]:
@@ -151,6 +165,36 @@ def test_stale_and_future_artifacts_are_rejected() -> None:
     future = audit_artifact(_artifact(generated_at=NOW + timedelta(minutes=1)), now=NOW)
     assert "TIME002" in _codes(stale)
     assert "TIME001" in _codes(future)
+
+
+def test_matching_execution_lock_is_accepted_without_disclosing_identity() -> None:
+    report = audit_artifact(_artifact(), expected_identity=_identity(), now=NOW)
+    assert report["status"] == "accepted"
+    assert len(report["execution_lock_sha256"]) == 64
+    serialized = json.dumps(report)
+    assert "Qwen-0.5B" not in serialized
+    assert "Qwen-tokenizer" not in serialized
+
+
+@pytest.mark.parametrize(
+    "artifact_field,artifact_value,code",
+    [
+        ("model_id", "other-model", "IDENTITY001"),
+        ("model_revision", "d" * 40, "IDENTITY002"),
+        ("tokenizer_id", "other-tokenizer", "IDENTITY003"),
+        ("tokenizer_revision", "e" * 40, "IDENTITY004"),
+        ("policy_id", "other-policy", "IDENTITY005"),
+        ("prompt_sha256", "f" * 64, "IDENTITY006"),
+    ],
+)
+def test_execution_lock_rejects_each_identity_mismatch(
+    artifact_field: str, artifact_value: str, code: str
+) -> None:
+    report = audit_artifact(
+        _artifact(**{artifact_field: artifact_value}), expected_identity=_identity(), now=NOW
+    )
+    assert report["status"] == "rejected"
+    assert _codes(report) == {code}
 
 
 @pytest.mark.parametrize(
@@ -267,6 +311,33 @@ def test_cli_has_distinct_accept_reject_and_malformed_exits(tmp_path: Path, monk
     assert json.loads((tmp_path / "a.json").read_text())["status"] == "accepted"
 
 
+def test_cli_execution_lock_is_atomic_and_enforced(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("structxai.perturbation_integrity.datetime", _FixedDateTime)
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text(json.dumps(_values()), encoding="utf-8")
+    base = ["--input", str(artifact), "--output", str(tmp_path / "report.json")]
+    partial = base + ["--expected-model-id", "Qwen-0.5B"]
+    assert main(partial) == 3
+
+    locked = base + [
+        "--expected-model-id",
+        "Qwen-0.5B",
+        "--expected-model-revision",
+        "b" * 40,
+        "--expected-tokenizer-id",
+        "Qwen-tokenizer",
+        "--expected-tokenizer-revision",
+        "c" * 40,
+        "--expected-policy-id",
+        "perturbation-policy-v1",
+        "--expected-prompt-sha256",
+        "a" * 64,
+    ]
+    assert main(locked) == 0
+    locked[-1] = "f" * 64
+    assert main(locked) == 2
+
+
 def test_policy_and_timestamp_validation() -> None:
     with pytest.raises(ValueError, match="positive"):
         AuditPolicy(max_variants=0)
@@ -274,3 +345,5 @@ def test_policy_and_timestamp_validation() -> None:
     values["generated_at"] = "2026-10-01T00:00:00"
     with pytest.raises(EvidenceError, match="timezone"):
         PerturbationArtifact.from_dict(values)
+    with pytest.raises(ValueError, match="model_revision"):
+        _identity(model_revision="main")
