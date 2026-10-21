@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from structxai.evaluation import evaluate_interventions
-from structxai.experiment import ExperimentSpec, compare_interventions
+from structxai.experiment import ExperimentSpec, PerturbationAuditSpec, compare_interventions
 from structxai.interventions import delete_literal, replace_literal
 from structxai.patching import patch_final_position, serialize_patch
 from structxai.provenance import validate_artifact
@@ -30,6 +30,10 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--name", default="experiment")
     compare.add_argument("--output", type=Path, default=Path("artifacts"))
     compare.add_argument("--device")
+    compare.add_argument("--model-revision")
+    compare.add_argument("--tokenizer-revision")
+    compare.add_argument("--perturbation-policy-id")
+    compare.add_argument("--protect", help="literal prompt span that perturbations must preserve")
 
     patch = sub.add_parser("patch", help="patch one layer's final-position activation")
     patch.add_argument("--source-prompt", required=True)
@@ -82,10 +86,40 @@ def main() -> int:
             if args.replacement is None:
                 raise SystemExit("--replace requires --with")
             interventions.append(replace_literal(args.prompt, args.replace, args.replacement))
+        audit_values = (
+            args.model_revision,
+            args.tokenizer_revision,
+            args.perturbation_policy_id,
+            args.protect,
+        )
+        if any(value is not None for value in audit_values) and not all(
+            value is not None for value in audit_values
+        ):
+            raise SystemExit(
+                "--model-revision, --tokenizer-revision, --perturbation-policy-id and --protect "
+                "must be supplied together"
+            )
+        audit = None
+        if all(value is not None for value in audit_values):
+            audit = PerturbationAuditSpec(
+                model_revision=args.model_revision,
+                tokenizer_revision=args.tokenizer_revision,
+                policy_id=args.perturbation_policy_id,
+                protected_literal=args.protect,
+            )
         spec = ExperimentSpec(args.name, args.prompt, tuple(args.candidates), args.model)
-        payload = compare_interventions(spec, interventions, args.output, device=args.device)
+        payload = compare_interventions(
+            spec,
+            interventions,
+            args.output,
+            device=args.device,
+            perturbation_audit=audit,
+        )
         html_path = render_report(payload, args.output / f"{args.name}.html")
-        print(json.dumps({"artifact": payload["artifact_path"], "report": str(html_path)}, indent=2))
+        result = {"artifact": payload["artifact_path"], "report": str(html_path)}
+        if audit is not None:
+            result["perturbation_audit"] = payload["perturbation_integrity"]["report_path"]
+        print(json.dumps(result, indent=2))
         return 0
 
     if args.command == "patch":
