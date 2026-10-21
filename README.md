@@ -124,6 +124,8 @@ then adds only their SHA-256 identities and paths to the main experiment artifac
 boundary mismatch, neighboring-token retokenization, protected-span mutation, identity mismatch,
 or malformed padding rejects the run before the main report is written. The edited and protected
 literals must each align exactly with tokenizer boundaries; the command fails closed when they do not.
+The integrated `compare` path currently covers delete and replace operations; mask variants remain
+available through the lower-level perturbation artifact API.
 
 ## 2. Understand the layer metric
 
