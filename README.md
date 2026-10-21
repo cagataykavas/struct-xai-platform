@@ -25,6 +25,7 @@ That separation is reflected directly in the codebase.
 | Layer-wise analysis | final-position hidden-state projection, candidate-aware scores, winner/runner-up trace |
 | Decision dynamics | signed candidate margins, sign-flip detection, peak effect layer |
 | Prompt interventions | reproducible literal deletion and replacement |
+| Perturbation integrity | fail-closed token-splice audit bound to immutable model/tokenizer revisions |
 | Causal intervention | single-layer final-position activation patching with forward hooks |
 | Quantitative evaluation | mean/max margin shift, final winner change, sign-flip count, intervention sensitivity |
 | Repeatability | cross-run Pearson correlation, sign agreement, absolute margin drift, final-winner agreement |
@@ -100,6 +101,29 @@ struct-xai compare \
   --replace 'Turkey' \
   --with 'Greece'
 ```
+
+For promotion-sensitive runs, bind the comparison to immutable model and tokenizer revisions and
+audit the actual tensors sent to the model:
+
+```bash
+struct-xai compare \
+  --name audited-country-deletion \
+  --prompt 'Question: What is the capital of Turkey? Answer: Ankara' \
+  --candidates ' Ankara' ' Istanbul' \
+  --delete 'Turkey' \
+  --protect 'Ankara' \
+  --model-revision "$MODEL_COMMIT" \
+  --tokenizer-revision "$TOKENIZER_COMMIT" \
+  --perturbation-policy-id token-splice-v1
+```
+
+This mode records tokenizer offset mappings in memory, converts the declared character edit to an
+exact token splice, and checks the baseline and changed `input_ids`/`attention_mask` before the
+behavioral metrics are admitted. It writes a raw perturbation artifact and a bounded audit report,
+then adds only their SHA-256 identities and paths to the main experiment artifact. A tokenizer
+boundary mismatch, neighboring-token retokenization, protected-span mutation, identity mismatch,
+or malformed padding rejects the run before the main report is written. The edited and protected
+literals must each align exactly with tokenizer boundaries; the command fails closed when they do not.
 
 ## 2. Understand the layer metric
 

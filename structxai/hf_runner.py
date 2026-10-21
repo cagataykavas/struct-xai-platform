@@ -43,15 +43,31 @@ def run_layerwise(
     candidate_labels: Sequence[str],
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
     device: str | None = None,
+    *,
+    model_revision: str | None = None,
+    tokenizer_revision: str | None = None,
+    capture_token_trace: bool = False,
 ) -> dict:
     resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if resolved_device == "cuda" else torch.float32
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(resolved_device)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=tokenizer_revision)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        revision=model_revision,
+        torch_dtype=dtype,
+    ).to(resolved_device)
     model.eval()
 
-    encoded = tokenizer(prompt, return_tensors="pt").to(resolved_device)
+    if capture_token_trace:
+        encoded = tokenizer(prompt, return_tensors="pt", return_offsets_mapping=True)
+        offsets = encoded.pop("offset_mapping")
+        input_ids = encoded["input_ids"][0].tolist()
+        attention_mask = encoded["attention_mask"][0].tolist()
+        offset_mapping = [tuple(pair) for pair in offsets[0].tolist()]
+    else:
+        encoded = tokenizer(prompt, return_tensors="pt")
+    encoded = encoded.to(resolved_device)
     with torch.no_grad():
         outputs = model(**encoded, output_hidden_states=True, use_cache=False)
 
@@ -70,7 +86,18 @@ def run_layerwise(
     }
     if len(candidates) == 2:
         result["sign_flips"] = [
-            asdict(item)
-            for item in find_sign_flips(decisions, candidates[0].label, candidates[1].label)
+            asdict(item) for item in find_sign_flips(decisions, candidates[0].label, candidates[1].label)
         ]
+    if capture_token_trace:
+        if tokenizer.pad_token_id is None:
+            raise ValueError("tokenizer must define pad_token_id for perturbation evidence")
+        result["_token_trace"] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "offset_mapping": offset_mapping,
+            "vocab_size": len(tokenizer),
+            "pad_token_id": tokenizer.pad_token_id,
+            "mask_token_id": tokenizer.mask_token_id,
+            "special_token_ids": sorted(set(tokenizer.all_special_ids)),
+        }
     return result
