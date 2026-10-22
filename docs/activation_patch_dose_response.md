@@ -33,7 +33,12 @@ placement and authentication:
 
 ```python
 from structxai.core import Candidate
-from structxai.patch_dose_response import PatchSweepSpec, run_residual_patch_sweep
+from structxai.patch_dose_response import (
+    DoseResponseAuditPolicy,
+    PatchSweepSpec,
+    require_dose_response_acceptance,
+    run_residual_patch_sweep,
+)
 
 spec = PatchSweepSpec(
     model_revision="sha256:2df4...",
@@ -51,10 +56,38 @@ report = run_residual_patch_sweep(
     target_input_ids=target_ids,
     spec=spec,
 )
+audit = require_dose_response_acceptance(
+    report,
+    policy=DoseResponseAuditPolicy(
+        min_endpoint_recovery=0.20,
+        min_monotonic_fraction=0.75,
+        max_step_regression=0.05,
+        max_abs_recovery=3.0,
+        min_qualified_layers=2,
+    ),
+)
 ```
 
 `model_calls` is known before execution: one source capture, one target capture, every
 layer-by-alpha intervention, and one final target repeat.
+
+## Prespecified promotion gate
+
+`audit_dose_response` evaluates every declared layer rather than returning only the best-looking
+curve. Per layer, it records endpoint recovery, trapezoidal normalized AUC, the fraction of
+non-regressing steps, the largest regression, the largest absolute recovery, stable finding codes,
+and a qualification decision. The terminal audit is accepted only when the configured minimum
+number of layers qualifies.
+
+`require_dose_response_acceptance` is the fail-closed CI/promotion entry point. It raises
+`DOSE_RESPONSE_AUDIT_REJECTED` for scientifically valid evidence that misses policy. Malformed,
+non-canonical, internally inconsistent, or digest-tampered evidence raises a distinct
+`PatchSweepError`. The audit binds the complete sweep digest, sweep-plan digest, policy digest and
+all layer assessments into a new deterministic SHA-256 evidence digest.
+
+The policy must be fixed before inspecting the sweep. A digest proves which policy was evaluated;
+it does not prove that the policy was independently preregistered or that a rejected run was not
+discarded.
 
 ## Interpretation and limits
 
@@ -65,5 +98,5 @@ semantically correct. Source and target positions remain a governed experimental
 runtime accepts one unpadded sequence per side and binds a caller-supplied model revision, but does
 not hash or authenticate model weights.
 
-The next increment is a Hugging Face adapter that records tokenizer offset mappings, model-weight
-provenance and signed run receipts, followed by prespecified monotonicity and cross-seed policies.
+The next increment is a Hugging Face adapter that records tokenizer offset mappings and model-weight
+provenance, followed by cross-seed aggregation and signed run receipts.

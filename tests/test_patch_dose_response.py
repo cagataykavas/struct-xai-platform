@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -7,9 +8,15 @@ import torch
 
 from structxai.core import Candidate
 from structxai.patch_dose_response import (
+    DoseResponseAuditPolicy,
+    DoseResponseAuditRejected,
     PatchSweepError,
+    PatchSweepPoint,
+    PatchSweepResult,
     PatchSweepSpec,
     SweepPolicy,
+    audit_dose_response,
+    require_dose_response_acceptance,
     run_residual_patch_sweep,
 )
 
@@ -106,6 +113,42 @@ def run(**kwargs: object):
         spec=spec(),
         **kwargs,
     )
+
+
+def sweep_evidence(
+    curves: dict[int, tuple[float, ...]],
+    *,
+    alphas: tuple[float, ...] = (0.0, 0.5, 1.0),
+) -> PatchSweepResult:
+    target_margin = -1.0
+    source_margin = 1.0
+    points = tuple(
+        PatchSweepPoint(
+            layer=layer,
+            alpha=alpha,
+            positive_score=target_margin + recovery * 2.0,
+            negative_score=0.0,
+            margin=target_margin + recovery * 2.0,
+            margin_delta=recovery * 2.0,
+            normalized_recovery=recovery,
+        )
+        for layer, recoveries in curves.items()
+        for alpha, recovery in zip(alphas, recoveries, strict=True)
+    )
+    return PatchSweepResult(
+        schema_version=1,
+        model_revision="sha256:test-model",
+        source_input_sha256="a" * 64,
+        target_input_sha256="b" * 64,
+        sweep_spec_sha256="c" * 64,
+        policy_sha256="d" * 64,
+        source_margin=source_margin,
+        target_margin=target_margin,
+        repeated_target_margin=target_margin,
+        model_calls=3 + len(points),
+        points=points,
+        evidence_sha256="",
+    ).with_digest()
 
 
 def test_runs_bounded_layer_and_alpha_sweep() -> None:
@@ -386,3 +429,107 @@ def test_report_does_not_contain_raw_candidate_labels_or_inputs() -> None:
     assert "secret_candidate_b" not in serialized
     assert "[3, 4, 5]" not in serialized
     assert "tensor" not in serialized
+
+
+def test_dose_response_audit_accepts_qualified_prespecified_layers() -> None:
+    audit = audit_dose_response(
+        sweep_evidence({2: (0.0, 0.30, 0.70), 5: (0.0, 0.45, 0.90)}),
+        policy=DoseResponseAuditPolicy(min_qualified_layers=2),
+    )
+
+    assert audit.status == "accepted"
+    assert audit.qualified_layers == 2
+    assert audit.layers[0].normalized_auc == pytest.approx(0.325)
+    assert audit.layers[0].monotonic_fraction == 1.0
+    assert len(audit.evidence_sha256) == 64
+
+
+def test_dose_response_audit_reports_each_failed_criterion() -> None:
+    audit = audit_dose_response(
+        sweep_evidence({2: (0.0, 0.80, 0.05), 5: (0.0, 6.00, 0.80)}),
+        policy=DoseResponseAuditPolicy(
+            min_endpoint_recovery=0.10,
+            min_monotonic_fraction=1.0,
+            max_step_regression=0.10,
+            max_abs_recovery=5.0,
+        ),
+    )
+
+    assert audit.status == "rejected"
+    assert audit.qualified_layers == 0
+    assert audit.finding_codes == ("QUALIFYING_LAYER_COUNT_BELOW_MINIMUM",)
+    assert audit.layers[0].finding_codes == (
+        "ENDPOINT_RECOVERY_BELOW_MINIMUM",
+        "MONOTONIC_FRACTION_BELOW_MINIMUM",
+        "STEP_REGRESSION_EXCEEDED",
+    )
+    assert audit.layers[1].finding_codes == (
+        "MONOTONIC_FRACTION_BELOW_MINIMUM",
+        "STEP_REGRESSION_EXCEEDED",
+        "RECOVERY_BOUND_EXCEEDED",
+    )
+
+
+def test_gate_raises_stable_error_on_scientific_rejection() -> None:
+    result = sweep_evidence({2: (0.0, 0.05, 0.09)})
+
+    with pytest.raises(DoseResponseAuditRejected, match="DOSE_RESPONSE_AUDIT_REJECTED"):
+        require_dose_response_acceptance(result)
+
+
+def test_audit_rejects_tampered_and_internally_inconsistent_evidence() -> None:
+    result = sweep_evidence({2: (0.0, 0.30, 0.70)})
+    tampered = replace(result, target_margin=-2.0)
+    with pytest.raises(PatchSweepError, match="SWEEP_EVIDENCE_DIGEST_MISMATCH"):
+        audit_dose_response(tampered)
+
+    inconsistent_point = replace(result.points[1], margin_delta=99.0)
+    inconsistent = replace(result, points=(result.points[0], inconsistent_point, result.points[2]))
+    inconsistent = inconsistent.with_digest()
+    with pytest.raises(PatchSweepError, match="INCONSISTENT_SWEEP_DELTA"):
+        audit_dose_response(inconsistent)
+
+
+def test_audit_requires_complete_consistent_canonical_ladders() -> None:
+    result = sweep_evidence({2: (0.0, 0.30, 0.70), 5: (0.0, 0.40, 0.80)})
+    shortened = replace(
+        result, points=result.points[:-1], model_calls=3 + len(result.points) - 1
+    ).with_digest()
+    with pytest.raises(PatchSweepError, match="INCOMPLETE_ALPHA_LADDER"):
+        audit_dose_response(shortened)
+
+    reordered = replace(
+        result, points=(result.points[3], *result.points[:3], *result.points[4:])
+    ).with_digest()
+    with pytest.raises(PatchSweepError, match="NON_CANONICAL_SWEEP_ORDER"):
+        audit_dose_response(reordered)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"min_endpoint_recovery": -0.1}, "min_endpoint_recovery"),
+        ({"min_monotonic_fraction": 1.1}, "min_monotonic_fraction"),
+        ({"monotonic_atol": float("nan")}, "monotonic_atol"),
+        ({"max_step_regression": -0.1}, "max_step_regression"),
+        ({"max_abs_recovery": 0.0}, "max_abs_recovery"),
+        ({"min_qualified_layers": 0}, "min_qualified_layers"),
+    ],
+)
+def test_dose_response_audit_policy_is_bounded(overrides: dict[str, object], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        DoseResponseAuditPolicy(**overrides)
+
+
+def test_dose_response_audit_is_deterministic_and_binds_policy() -> None:
+    result = sweep_evidence({2: (0.0, 0.30, 0.70)})
+    first = audit_dose_response(result)
+    second = audit_dose_response(result)
+    stricter = audit_dose_response(
+        result,
+        policy=DoseResponseAuditPolicy(min_endpoint_recovery=0.80),
+    )
+
+    assert first.as_dict() == second.as_dict()
+    assert first.audit_policy_sha256 != stricter.audit_policy_sha256
+    assert first.evidence_sha256 != stricter.evidence_sha256

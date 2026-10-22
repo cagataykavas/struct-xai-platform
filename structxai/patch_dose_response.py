@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import re
@@ -23,6 +24,10 @@ class PatchSweepError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class DoseResponseAuditRejected(PatchSweepError):
+    """A valid sweep failed its prespecified promotion policy."""
 
 
 @dataclass(frozen=True)
@@ -153,6 +158,95 @@ class PatchSweepResult:
         return replace(self, evidence_sha256=_digest(self.body()))
 
 
+@dataclass(frozen=True)
+class DoseResponseAuditPolicy:
+    """Prespecified acceptance bounds for a completed dose-response sweep."""
+
+    min_endpoint_recovery: float = 0.10
+    min_monotonic_fraction: float = 0.75
+    monotonic_atol: float = 1e-6
+    max_step_regression: float = 0.05
+    max_abs_recovery: float = 5.0
+    min_qualified_layers: int = 1
+
+    def __post_init__(self) -> None:
+        for name, value, lower, upper in (
+            ("min_endpoint_recovery", self.min_endpoint_recovery, 0.0, 1.0),
+            ("min_monotonic_fraction", self.min_monotonic_fraction, 0.0, 1.0),
+            ("monotonic_atol", self.monotonic_atol, 0.0, 1.0),
+            ("max_step_regression", self.max_step_regression, 0.0, 10.0),
+            ("max_abs_recovery", self.max_abs_recovery, 1e-12, 1_000.0),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not lower <= float(value) <= upper
+            ):
+                raise ValueError(f"{name} must be finite and between {lower} and {upper}")
+        if (
+            isinstance(self.min_qualified_layers, bool)
+            or not isinstance(self.min_qualified_layers, int)
+            or not 1 <= self.min_qualified_layers <= 1_024
+        ):
+            raise ValueError("min_qualified_layers must be between 1 and 1024")
+
+    def as_dict(self) -> dict[str, int | float]:
+        return {
+            "min_endpoint_recovery": float(self.min_endpoint_recovery),
+            "min_monotonic_fraction": float(self.min_monotonic_fraction),
+            "monotonic_atol": float(self.monotonic_atol),
+            "max_step_regression": float(self.max_step_regression),
+            "max_abs_recovery": float(self.max_abs_recovery),
+            "min_qualified_layers": self.min_qualified_layers,
+        }
+
+
+@dataclass(frozen=True)
+class LayerDoseAssessment:
+    layer: int
+    endpoint_recovery: float
+    normalized_auc: float
+    monotonic_fraction: float
+    largest_step_regression: float
+    peak_abs_recovery: float
+    qualified: bool
+    finding_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DoseResponseAudit:
+    schema_version: int
+    status: str
+    sweep_evidence_sha256: str
+    sweep_spec_sha256: str
+    audit_policy_sha256: str
+    total_layers: int
+    qualified_layers: int
+    layers: tuple[LayerDoseAssessment, ...]
+    finding_codes: tuple[str, ...]
+    evidence_sha256: str
+
+    def body(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "status": self.status,
+            "sweep_evidence_sha256": self.sweep_evidence_sha256,
+            "sweep_spec_sha256": self.sweep_spec_sha256,
+            "audit_policy_sha256": self.audit_policy_sha256,
+            "total_layers": self.total_layers,
+            "qualified_layers": self.qualified_layers,
+            "layers": [asdict(layer) for layer in self.layers],
+            "finding_codes": list(self.finding_codes),
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return {**self.body(), "evidence_sha256": self.evidence_sha256}
+
+    def with_digest(self) -> DoseResponseAudit:
+        return replace(self, evidence_sha256=_digest(self.body()))
+
+
 def _validate_candidate(candidate: Candidate) -> None:
     if not isinstance(candidate.label, str) or not candidate.label or len(candidate.label) > 128:
         raise PatchSweepError("INVALID_CANDIDATE_LABEL")
@@ -252,6 +346,190 @@ def _margin(
     if not all(math.isfinite(value) for value in (positive, negative, margin)):
         raise PatchSweepError("NON_FINITE_CANDIDATE_SCORE")
     return positive, negative, margin
+
+
+def _validated_layer_curves(result: PatchSweepResult) -> tuple[tuple[int, tuple[PatchSweepPoint, ...]], ...]:
+    if (
+        not isinstance(result, PatchSweepResult)
+        or type(result.schema_version) is not int
+        or result.schema_version != 1
+    ):
+        raise PatchSweepError("UNSUPPORTED_SWEEP_EVIDENCE")
+    if not re.fullmatch(r"[0-9a-f]{64}", result.evidence_sha256) or not hmac.compare_digest(
+        result.evidence_sha256, _digest(result.body())
+    ):
+        raise PatchSweepError("SWEEP_EVIDENCE_DIGEST_MISMATCH")
+    if not result.points:
+        raise PatchSweepError("EMPTY_SWEEP_EVIDENCE")
+    if (
+        type(result.model_calls) is not int
+        or result.model_calls != 3 + len(result.points)
+        or any(
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            for digest in (
+                result.source_input_sha256,
+                result.target_input_sha256,
+                result.sweep_spec_sha256,
+                result.policy_sha256,
+            )
+        )
+    ):
+        raise PatchSweepError("INVALID_SWEEP_METADATA")
+    if not all(
+        math.isfinite(value)
+        for value in (result.source_margin, result.target_margin, result.repeated_target_margin)
+    ):
+        raise PatchSweepError("NON_FINITE_SWEEP_EVIDENCE")
+
+    margin_gap = result.source_margin - result.target_margin
+    if margin_gap == 0.0 or not math.isfinite(margin_gap):
+        raise PatchSweepError("INVALID_SWEEP_MARGIN_GAP")
+
+    grouped: list[tuple[int, list[PatchSweepPoint]]] = []
+    for point in result.points:
+        if not isinstance(point, PatchSweepPoint):
+            raise PatchSweepError("INVALID_SWEEP_POINT")
+        if isinstance(point.layer, bool) or not isinstance(point.layer, int) or point.layer < 0:
+            raise PatchSweepError("INVALID_SWEEP_LAYER")
+        values = (
+            point.alpha,
+            point.positive_score,
+            point.negative_score,
+            point.margin,
+            point.margin_delta,
+            point.normalized_recovery,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            for value in values
+        ):
+            raise PatchSweepError("NON_FINITE_SWEEP_POINT")
+        if not math.isclose(point.margin, point.positive_score - point.negative_score, abs_tol=1e-9):
+            raise PatchSweepError("INCONSISTENT_SWEEP_MARGIN")
+        if not math.isclose(point.margin_delta, point.margin - result.target_margin, abs_tol=1e-9):
+            raise PatchSweepError("INCONSISTENT_SWEEP_DELTA")
+        if not math.isclose(point.normalized_recovery, point.margin_delta / margin_gap, abs_tol=1e-9):
+            raise PatchSweepError("INCONSISTENT_SWEEP_RECOVERY")
+
+        if not grouped or grouped[-1][0] != point.layer:
+            if grouped and point.layer <= grouped[-1][0]:
+                raise PatchSweepError("NON_CANONICAL_SWEEP_ORDER")
+            grouped.append((point.layer, []))
+        grouped[-1][1].append(point)
+
+    reference_alphas: tuple[float, ...] | None = None
+    curves: list[tuple[int, tuple[PatchSweepPoint, ...]]] = []
+    for layer, points in grouped:
+        alphas = tuple(float(point.alpha) for point in points)
+        if len(alphas) < 3 or alphas[0] != 0.0 or alphas[-1] != 1.0:
+            raise PatchSweepError("INCOMPLETE_ALPHA_LADDER")
+        if any(current <= previous for previous, current in pairwise(alphas)):
+            raise PatchSweepError("NON_CANONICAL_ALPHA_ORDER")
+        if reference_alphas is None:
+            reference_alphas = alphas
+        elif alphas != reference_alphas:
+            raise PatchSweepError("INCONSISTENT_ALPHA_LADDERS")
+        if not math.isclose(points[0].normalized_recovery, 0.0, abs_tol=1e-9):
+            raise PatchSweepError("INVALID_ZERO_DOSE_RECOVERY")
+        curves.append((layer, tuple(points)))
+    return tuple(curves)
+
+
+def audit_dose_response(
+    result: PatchSweepResult,
+    *,
+    policy: DoseResponseAuditPolicy | None = None,
+) -> DoseResponseAudit:
+    """Evaluate every declared layer against a prespecified dose-response policy.
+
+    Scientific rejection is returned as a signed-by-digest audit artifact. Malformed or
+    tampered sweep evidence raises :class:`PatchSweepError` instead.
+    """
+
+    active_policy = policy or DoseResponseAuditPolicy()
+    curves = _validated_layer_curves(result)
+    assessments: list[LayerDoseAssessment] = []
+
+    for layer, points in curves:
+        recoveries = tuple(float(point.normalized_recovery) for point in points)
+        steps = tuple(current - previous for previous, current in pairwise(recoveries))
+        endpoint_recovery = recoveries[-1]
+        monotonic_fraction = sum(step >= -float(active_policy.monotonic_atol) for step in steps) / len(steps)
+        largest_step_regression = max(0.0, -min(steps))
+        peak_abs_recovery = max(abs(value) for value in recoveries)
+        normalized_auc = sum(
+            (points[index].alpha - points[index - 1].alpha)
+            * (recoveries[index - 1] + recoveries[index])
+            / 2.0
+            for index in range(1, len(points))
+        )
+        if not all(
+            math.isfinite(value)
+            for value in (
+                endpoint_recovery,
+                monotonic_fraction,
+                largest_step_regression,
+                peak_abs_recovery,
+                normalized_auc,
+            )
+        ):
+            raise PatchSweepError("NON_FINITE_AUDIT_METRIC")
+
+        findings: list[str] = []
+        if endpoint_recovery < active_policy.min_endpoint_recovery:
+            findings.append("ENDPOINT_RECOVERY_BELOW_MINIMUM")
+        if monotonic_fraction < active_policy.min_monotonic_fraction:
+            findings.append("MONOTONIC_FRACTION_BELOW_MINIMUM")
+        if largest_step_regression > active_policy.max_step_regression:
+            findings.append("STEP_REGRESSION_EXCEEDED")
+        if peak_abs_recovery > active_policy.max_abs_recovery:
+            findings.append("RECOVERY_BOUND_EXCEEDED")
+
+        assessments.append(
+            LayerDoseAssessment(
+                layer=layer,
+                endpoint_recovery=endpoint_recovery,
+                normalized_auc=normalized_auc,
+                monotonic_fraction=monotonic_fraction,
+                largest_step_regression=largest_step_regression,
+                peak_abs_recovery=peak_abs_recovery,
+                qualified=not findings,
+                finding_codes=tuple(findings),
+            )
+        )
+
+    qualified_layers = sum(assessment.qualified for assessment in assessments)
+    global_findings = (
+        ()
+        if qualified_layers >= active_policy.min_qualified_layers
+        else ("QUALIFYING_LAYER_COUNT_BELOW_MINIMUM",)
+    )
+    audit = DoseResponseAudit(
+        schema_version=1,
+        status="accepted" if not global_findings else "rejected",
+        sweep_evidence_sha256=result.evidence_sha256,
+        sweep_spec_sha256=result.sweep_spec_sha256,
+        audit_policy_sha256=_digest(active_policy.as_dict()),
+        total_layers=len(assessments),
+        qualified_layers=qualified_layers,
+        layers=tuple(assessments),
+        finding_codes=global_findings,
+        evidence_sha256="",
+    )
+    return audit.with_digest()
+
+
+def require_dose_response_acceptance(
+    result: PatchSweepResult,
+    *,
+    policy: DoseResponseAuditPolicy | None = None,
+) -> DoseResponseAudit:
+    """Return an accepted audit or raise a stable promotion-gate error."""
+
+    audit = audit_dose_response(result, policy=policy)
+    if audit.status != "accepted":
+        raise DoseResponseAuditRejected("DOSE_RESPONSE_AUDIT_REJECTED")
+    return audit
 
 
 def run_residual_patch_sweep(
