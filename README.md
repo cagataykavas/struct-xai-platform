@@ -175,7 +175,8 @@ This is implemented with real forward hooks; it is not a static diagram standing
 
 The production-minded dose-response path evaluates intermediate intervention strengths, repeats
 the unpatched baseline to detect hook leakage, and can fail a promotion gate on weak endpoint
-recovery, non-monotonic behavior, large reversals, or unstable overshoot. See
+recovery, non-monotonic behavior, large reversals, or unstable overshoot. A second gate aggregates
+matching seed runs and rejects unstable qualification rates, effect signs, endpoints, or AUCs. See
 [`docs/activation_patch_dose_response.md`](docs/activation_patch_dose_response.md).
 
 ## Experiment artifact and provenance
@@ -250,7 +251,7 @@ structxai/
   hf_runner.py       Hugging Face model adapter
   interventions.py   controlled prompt mutations
   patching.py        activation patching
-  patch_dose_response.py bounded layer/dose sweeps and acceptance audit
+  patch_dose_response.py bounded layer/dose sweeps, per-run and cross-seed audits
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation
@@ -273,7 +274,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - quantitative intervention evaluation;
 - provenance validation;
 - cross-run stability metrics;
-- activation-patch isolation and dose-response policy checks;
+- activation-patch isolation, dose-response and cross-seed stability policy checks;
 - HTML report generation;
 - experiment metadata lifecycle;
 - CLI/package imports;

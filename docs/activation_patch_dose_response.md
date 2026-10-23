@@ -34,8 +34,10 @@ placement and authentication:
 ```python
 from structxai.core import Candidate
 from structxai.patch_dose_response import (
+    CrossSeedPolicy,
     DoseResponseAuditPolicy,
     PatchSweepSpec,
+    require_cross_seed_dose_response_acceptance,
     require_dose_response_acceptance,
     run_residual_patch_sweep,
 )
@@ -66,6 +68,20 @@ audit = require_dose_response_acceptance(
         min_qualified_layers=2,
     ),
 )
+
+# Repeat the same governed experiment under independently selected seeds.
+seed_audit = require_cross_seed_dose_response_acceptance(
+    {11: report_seed_11, 22: report_seed_22, 33: report_seed_33},
+    dose_policy=DoseResponseAuditPolicy(min_qualified_layers=2),
+    cross_seed_policy=CrossSeedPolicy(
+        min_seed_runs=3,
+        min_seed_qualification_fraction=0.80,
+        min_endpoint_sign_agreement=0.80,
+        max_endpoint_range=0.25,
+        max_auc_range=0.25,
+        min_stable_layers=2,
+    ),
+)
 ```
 
 `model_calls` is known before execution: one source capture, one target capture, every
@@ -89,6 +105,29 @@ The policy must be fixed before inspecting the sweep. A digest proves which poli
 it does not prove that the policy was independently preregistered or that a rejected run was not
 discarded.
 
+## Cross-seed promotion gate
+
+`audit_cross_seed_dose_response` first revalidates every child sweep and reruns the same
+`DoseResponseAuditPolicy`; a supplied per-seed acceptance flag is never trusted. It then requires
+the model revision, source and target input digests, sweep plan, execution policy, layer set and
+alpha ladder to match exactly. Seed labels are non-negative integers and are sorted before hashing,
+so mapping insertion order cannot change the result.
+
+For every layer the aggregate records:
+
+- the fraction of seeds passing the per-run dose-response policy;
+- endpoint-recovery mean and range;
+- normalized-AUC mean and range;
+- the fraction of endpoints sharing the most common effect sign;
+- stable finding codes and a cross-seed qualification decision.
+
+The number of accepted seed runs and stable layers is bounded by `CrossSeedPolicy`. The terminal
+evidence includes each seed label plus its sweep and per-run audit digests, both policy digests, all
+aggregate metrics, and a deterministic SHA-256 digest. Raw prompts, tokens and activations are not
+copied into the aggregate. `require_cross_seed_dose_response_acceptance` raises
+`CROSS_SEED_DOSE_RESPONSE_REJECTED` for valid but unstable evidence; malformed, tampered or
+mismatched runs fail separately.
+
 ## Interpretation and limits
 
 A smooth or monotonic dose response is useful evidence that a reported patch effect is not merely a
@@ -98,5 +137,11 @@ semantically correct. Source and target positions remain a governed experimental
 runtime accepts one unpadded sequence per side and binds a caller-supplied model revision, but does
 not hash or authenticate model weights.
 
+Cross-seed agreement reduces dependence on one random run, but it does not establish statistical
+independence or prove that the declared seed was applied. Identical evidence under different labels
+is permitted because a deterministic model can legitimately reproduce bit-for-bit. Production
+provenance should bind RNG state and signed execution receipts; larger uncertainty claims should use
+more than the default three-run minimum.
+
 The next increment is a Hugging Face adapter that records tokenizer offset mappings and model-weight
-provenance, followed by cross-seed aggregation and signed run receipts.
+provenance, followed by signed run receipts.

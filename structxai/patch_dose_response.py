@@ -6,8 +6,10 @@ import json
 import math
 import re
 import struct
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from itertools import pairwise
+from statistics import fmean
 from typing import Any
 
 import torch
@@ -28,6 +30,10 @@ class PatchSweepError(ValueError):
 
 class DoseResponseAuditRejected(PatchSweepError):
     """A valid sweep failed its prespecified promotion policy."""
+
+
+class CrossSeedDoseResponseRejected(PatchSweepError):
+    """Valid per-seed sweeps failed the cross-seed promotion policy."""
 
 
 @dataclass(frozen=True)
@@ -247,6 +253,116 @@ class DoseResponseAudit:
         return replace(self, evidence_sha256=_digest(self.body()))
 
 
+@dataclass(frozen=True)
+class CrossSeedPolicy:
+    """Prespecified stability bounds across independently labelled seed runs."""
+
+    min_seed_runs: int = 3
+    max_seed_runs: int = 64
+    min_seed_qualification_fraction: float = 0.80
+    min_endpoint_sign_agreement: float = 0.80
+    max_endpoint_range: float = 0.25
+    max_auc_range: float = 0.25
+    sign_atol: float = 1e-6
+    min_stable_layers: int = 1
+
+    def __post_init__(self) -> None:
+        for name, value, lower, upper in (
+            ("min_seed_runs", self.min_seed_runs, 2, 1_024),
+            ("max_seed_runs", self.max_seed_runs, 2, 1_024),
+            ("min_stable_layers", self.min_stable_layers, 1, 1_024),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
+                raise ValueError(f"{name} must be between {lower} and {upper}")
+        if self.min_seed_runs > self.max_seed_runs:
+            raise ValueError("min_seed_runs cannot exceed max_seed_runs")
+        for name, value, lower, upper in (
+            (
+                "min_seed_qualification_fraction",
+                self.min_seed_qualification_fraction,
+                0.0,
+                1.0,
+            ),
+            ("min_endpoint_sign_agreement", self.min_endpoint_sign_agreement, 0.0, 1.0),
+            ("max_endpoint_range", self.max_endpoint_range, 0.0, 1_000.0),
+            ("max_auc_range", self.max_auc_range, 0.0, 1_000.0),
+            ("sign_atol", self.sign_atol, 0.0, 1.0),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not lower <= float(value) <= upper
+            ):
+                raise ValueError(f"{name} must be finite and between {lower} and {upper}")
+
+    def as_dict(self) -> dict[str, int | float]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SeedSweepEvidence:
+    seed: int
+    sweep_evidence_sha256: str
+    dose_audit_sha256: str
+
+
+@dataclass(frozen=True)
+class CrossSeedLayerAssessment:
+    layer: int
+    mean_endpoint_recovery: float
+    endpoint_recovery_range: float
+    mean_normalized_auc: float
+    normalized_auc_range: float
+    seed_qualification_fraction: float
+    endpoint_sign_agreement: float
+    stable: bool
+    finding_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CrossSeedDoseResponseAudit:
+    schema_version: int
+    status: str
+    model_revision: str
+    source_input_sha256: str
+    target_input_sha256: str
+    sweep_spec_sha256: str
+    sweep_policy_sha256: str
+    dose_policy_sha256: str
+    cross_seed_policy_sha256: str
+    seed_runs: tuple[SeedSweepEvidence, ...]
+    total_layers: int
+    stable_layers: int
+    layers: tuple[CrossSeedLayerAssessment, ...]
+    finding_codes: tuple[str, ...]
+    evidence_sha256: str
+
+    def body(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "status": self.status,
+            "model_revision": self.model_revision,
+            "source_input_sha256": self.source_input_sha256,
+            "target_input_sha256": self.target_input_sha256,
+            "sweep_spec_sha256": self.sweep_spec_sha256,
+            "sweep_policy_sha256": self.sweep_policy_sha256,
+            "dose_policy_sha256": self.dose_policy_sha256,
+            "cross_seed_policy_sha256": self.cross_seed_policy_sha256,
+            "seed_runs": [asdict(run) for run in self.seed_runs],
+            "total_layers": self.total_layers,
+            "stable_layers": self.stable_layers,
+            "layers": [asdict(layer) for layer in self.layers],
+            "finding_codes": list(self.finding_codes),
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return {**self.body(), "evidence_sha256": self.evidence_sha256}
+
+    def with_digest(self) -> CrossSeedDoseResponseAudit:
+        return replace(self, evidence_sha256=_digest(self.body()))
+
+
 def _validate_candidate(candidate: Candidate) -> None:
     if not isinstance(candidate.label, str) or not candidate.label or len(candidate.label) > 128:
         raise PatchSweepError("INVALID_CANDIDATE_LABEL")
@@ -364,6 +480,9 @@ def _validated_layer_curves(result: PatchSweepResult) -> tuple[tuple[int, tuple[
     if (
         type(result.model_calls) is not int
         or result.model_calls != 3 + len(result.points)
+        or not isinstance(result.model_revision, str)
+        or not REVISION.fullmatch(result.model_revision)
+        or result.model_revision.casefold() in MUTABLE_REVISIONS
         or any(
             not re.fullmatch(r"[0-9a-f]{64}", digest)
             for digest in (
@@ -529,6 +648,146 @@ def require_dose_response_acceptance(
     audit = audit_dose_response(result, policy=policy)
     if audit.status != "accepted":
         raise DoseResponseAuditRejected("DOSE_RESPONSE_AUDIT_REJECTED")
+    return audit
+
+
+def _effect_sign(value: float, atol: float) -> int:
+    if value > atol:
+        return 1
+    if value < -atol:
+        return -1
+    return 0
+
+
+def audit_cross_seed_dose_response(
+    runs: Mapping[int, PatchSweepResult],
+    *,
+    dose_policy: DoseResponseAuditPolicy | None = None,
+    cross_seed_policy: CrossSeedPolicy | None = None,
+) -> CrossSeedDoseResponseAudit:
+    """Aggregate matching dose-response sweeps under a prespecified seed policy."""
+
+    active_dose_policy = dose_policy or DoseResponseAuditPolicy()
+    active_cross_seed_policy = cross_seed_policy or CrossSeedPolicy()
+    if not isinstance(runs, Mapping):
+        raise PatchSweepError("INVALID_SEED_RUNS")
+    seed_runs = tuple(runs.items())
+    if not active_cross_seed_policy.min_seed_runs <= len(seed_runs) <= active_cross_seed_policy.max_seed_runs:
+        raise PatchSweepError("SEED_RUN_COUNT_OUT_OF_BOUNDS")
+    if any(isinstance(seed, bool) or not isinstance(seed, int) or seed < 0 for seed, _ in seed_runs):
+        raise PatchSweepError("INVALID_SEED_ID")
+    ordered_runs = tuple(sorted(seed_runs, key=lambda item: item[0]))
+
+    reference_identity: tuple[object, ...] | None = None
+    reference_curve_shape: tuple[tuple[int, tuple[float, ...]], ...] | None = None
+    seed_evidence: list[SeedSweepEvidence] = []
+    per_seed_assessments: list[tuple[int, tuple[LayerDoseAssessment, ...]]] = []
+
+    for seed, result in ordered_runs:
+        audit = audit_dose_response(result, policy=active_dose_policy)
+        curves = _validated_layer_curves(result)
+        identity = (
+            result.model_revision,
+            result.source_input_sha256,
+            result.target_input_sha256,
+            result.sweep_spec_sha256,
+            result.policy_sha256,
+        )
+        curve_shape = tuple(
+            (layer, tuple(float(point.alpha) for point in points)) for layer, points in curves
+        )
+        if reference_identity is None:
+            reference_identity = identity
+            reference_curve_shape = curve_shape
+        elif identity != reference_identity or curve_shape != reference_curve_shape:
+            raise PatchSweepError("CROSS_SEED_EXPERIMENT_MISMATCH")
+        seed_evidence.append(
+            SeedSweepEvidence(
+                seed=seed,
+                sweep_evidence_sha256=result.evidence_sha256,
+                dose_audit_sha256=audit.evidence_sha256,
+            )
+        )
+        per_seed_assessments.append((seed, audit.layers))
+
+    if reference_identity is None or reference_curve_shape is None:
+        raise PatchSweepError("SEED_RUN_COUNT_OUT_OF_BOUNDS")
+    layer_assessments: list[CrossSeedLayerAssessment] = []
+    for layer_index, (layer, _) in enumerate(reference_curve_shape):
+        assessments = tuple(rows[layer_index] for _, rows in per_seed_assessments)
+        if any(assessment.layer != layer for assessment in assessments):
+            raise PatchSweepError("CROSS_SEED_EXPERIMENT_MISMATCH")
+        endpoints = tuple(assessment.endpoint_recovery for assessment in assessments)
+        aucs = tuple(assessment.normalized_auc for assessment in assessments)
+        qualification_fraction = sum(assessment.qualified for assessment in assessments) / len(assessments)
+        signs = tuple(_effect_sign(value, float(active_cross_seed_policy.sign_atol)) for value in endpoints)
+        sign_agreement = max(signs.count(sign) for sign in set(signs)) / len(signs)
+        endpoint_range = max(endpoints) - min(endpoints)
+        auc_range = max(aucs) - min(aucs)
+        findings: list[str] = []
+        if qualification_fraction < active_cross_seed_policy.min_seed_qualification_fraction:
+            findings.append("SEED_QUALIFICATION_FRACTION_BELOW_MINIMUM")
+        if sign_agreement < active_cross_seed_policy.min_endpoint_sign_agreement:
+            findings.append("ENDPOINT_SIGN_AGREEMENT_BELOW_MINIMUM")
+        if endpoint_range > active_cross_seed_policy.max_endpoint_range:
+            findings.append("ENDPOINT_RANGE_EXCEEDED")
+        if auc_range > active_cross_seed_policy.max_auc_range:
+            findings.append("AUC_RANGE_EXCEEDED")
+        layer_assessments.append(
+            CrossSeedLayerAssessment(
+                layer=layer,
+                mean_endpoint_recovery=fmean(endpoints),
+                endpoint_recovery_range=endpoint_range,
+                mean_normalized_auc=fmean(aucs),
+                normalized_auc_range=auc_range,
+                seed_qualification_fraction=qualification_fraction,
+                endpoint_sign_agreement=sign_agreement,
+                stable=not findings,
+                finding_codes=tuple(findings),
+            )
+        )
+
+    stable_layers = sum(assessment.stable for assessment in layer_assessments)
+    global_findings = (
+        ()
+        if stable_layers >= active_cross_seed_policy.min_stable_layers
+        else ("STABLE_LAYER_COUNT_BELOW_MINIMUM",)
+    )
+    result = CrossSeedDoseResponseAudit(
+        schema_version=1,
+        status="accepted" if not global_findings else "rejected",
+        model_revision=str(reference_identity[0]),
+        source_input_sha256=str(reference_identity[1]),
+        target_input_sha256=str(reference_identity[2]),
+        sweep_spec_sha256=str(reference_identity[3]),
+        sweep_policy_sha256=str(reference_identity[4]),
+        dose_policy_sha256=_digest(active_dose_policy.as_dict()),
+        cross_seed_policy_sha256=_digest(active_cross_seed_policy.as_dict()),
+        seed_runs=tuple(seed_evidence),
+        total_layers=len(layer_assessments),
+        stable_layers=stable_layers,
+        layers=tuple(layer_assessments),
+        finding_codes=global_findings,
+        evidence_sha256="",
+    )
+    return result.with_digest()
+
+
+def require_cross_seed_dose_response_acceptance(
+    runs: Mapping[int, PatchSweepResult],
+    *,
+    dose_policy: DoseResponseAuditPolicy | None = None,
+    cross_seed_policy: CrossSeedPolicy | None = None,
+) -> CrossSeedDoseResponseAudit:
+    """Return accepted cross-seed evidence or raise a stable gate error."""
+
+    audit = audit_cross_seed_dose_response(
+        runs,
+        dose_policy=dose_policy,
+        cross_seed_policy=cross_seed_policy,
+    )
+    if audit.status != "accepted":
+        raise CrossSeedDoseResponseRejected("CROSS_SEED_DOSE_RESPONSE_REJECTED")
     return audit
 
 
