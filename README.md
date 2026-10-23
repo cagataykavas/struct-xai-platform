@@ -25,7 +25,7 @@ That separation is reflected directly in the codebase.
 | Layer-wise analysis | final-position hidden-state projection, candidate-aware scores, winner/runner-up trace |
 | Decision dynamics | signed candidate margins, sign-flip detection, peak effect layer |
 | Prompt interventions | reproducible literal deletion and replacement |
-| Causal intervention | single-layer final-position activation patching with forward hooks |
+| Causal intervention | single-layer patching plus bounded layer × dose sweeps with prespecified promotion gates |
 | Quantitative evaluation | mean/max margin shift, final winner change, sign-flip count, intervention sensitivity |
 | Repeatability | cross-run Pearson correlation, sign agreement, absolute margin drift, final-winner agreement |
 | Provenance | experiment fingerprint, prompt/candidate SHA-256, model, metric, device/dtype, runtime versions, source revision |
@@ -173,6 +173,12 @@ The public patching experiment is intentionally narrow and inspectable. It captu
 
 This is implemented with real forward hooks; it is not a static diagram standing in for activation patching.
 
+The production-minded dose-response path evaluates intermediate intervention strengths, repeats
+the unpatched baseline to detect hook leakage, and can fail a promotion gate on weak endpoint
+recovery, non-monotonic behavior, large reversals, or unstable overshoot. A second gate aggregates
+matching seed runs and rejects unstable qualification rates, effect signs, endpoints, or AUCs. See
+[`docs/activation_patch_dose_response.md`](docs/activation_patch_dose_response.md).
+
 ## Experiment artifact and provenance
 
 A JSON artifact contains:
@@ -245,6 +251,7 @@ structxai/
   hf_runner.py       Hugging Face model adapter
   interventions.py   controlled prompt mutations
   patching.py        activation patching
+  patch_dose_response.py bounded layer/dose sweeps, per-run and cross-seed audits
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation
@@ -267,6 +274,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - quantitative intervention evaluation;
 - provenance validation;
 - cross-run stability metrics;
+- activation-patch isolation, dose-response and cross-seed stability policy checks;
 - HTML report generation;
 - experiment metadata lifecycle;
 - CLI/package imports;
@@ -281,7 +289,7 @@ The repository tries to make its limitations visible:
 - first-token candidate margins are not full candidate sequence likelihoods;
 - logit-lens projections are diagnostic views, not automatically causal explanations;
 - deletion/replacement effects can be confounded by distribution shift;
-- activation patching is currently limited to one layer and the final sequence position;
+- activation patching targets one token position per run; dose sweeps evaluate a bounded layer set;
 - cross-run stability measures repeatability, not truth;
 - a visually clean heatmap is not treated as evidence without an explicit metric and experiment identity.
 
