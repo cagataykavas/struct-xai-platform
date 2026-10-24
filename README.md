@@ -179,6 +179,12 @@ recovery, non-monotonic behavior, large reversals, or unstable overshoot. A seco
 matching seed runs and rejects unstable qualification rates, effect signs, endpoints, or AUCs. See
 [`docs/activation_patch_dose_response.md`](docs/activation_patch_dose_response.md).
 
+For promotion workflows, `PatchRunSigner` now executes each sweep inside a controlled Python/Torch
+seed boundary, restores the caller's RNG state in `finally`, and emits a fresh HMAC-SHA256 receipt.
+The receipt binds the declared seed, pre/post RNG-state digests, exact sweep evidence, immutable
+model/tokenizer artifact digests, issue time, run identity, and signing-key ID. An authenticated
+cross-seed wrapper verifies every receipt before binding them to the aggregate audit.
+
 ## Experiment artifact and provenance
 
 A JSON artifact contains:
@@ -252,6 +258,7 @@ structxai/
   interventions.py   controlled prompt mutations
   patching.py        activation patching
   patch_dose_response.py bounded layer/dose sweeps, per-run and cross-seed audits
+  patch_run_receipt.py seeded execution boundary and authenticated run provenance
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation

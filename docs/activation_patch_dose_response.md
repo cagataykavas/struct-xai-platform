@@ -128,20 +128,67 @@ copied into the aggregate. `require_cross_seed_dose_response_acceptance` raises
 `CROSS_SEED_DOSE_RESPONSE_REJECTED` for valid but unstable evidence; malformed, tampered or
 mismatched runs fail separately.
 
+## Authenticated seeded-run provenance
+
+Caller-provided seed labels alone do not show that a runtime actually applied the seed. The
+`PatchRunSigner` boundary seeds Python and CPU Torch immediately before the sweep callback, hashes
+the pre/post RNG states, validates the returned sweep evidence, and restores the caller's original
+states even when execution raises. Raw RNG state and secret key bytes are never copied into the
+receipt.
+
+```python
+from structxai.patch_run_receipt import (
+    PatchRunSigner,
+    audit_authenticated_cross_seed_dose_response,
+)
+
+signer = PatchRunSigner.from_env()
+report, receipt = signer.run(
+    lambda: run_residual_patch_sweep(
+        model,
+        source_input_ids=source_ids,
+        target_input_ids=target_ids,
+        spec=spec,
+    ),
+    seed=11,
+    model_artifact_sha256=model_weights_sha256,
+    tokenizer_artifact_sha256=tokenizer_bundle_sha256,
+)
+
+authenticated = audit_authenticated_cross_seed_dose_response(
+    {11: report_11, 22: report_22, 33: report_33},
+    {11: receipt_11, 22: receipt_22, 33: receipt_33},
+    verification_keyring,
+)
+```
+
+Configure signing material outside the repository:
+
+```bash
+export STRUCTXAI_PATCH_RECEIPT_KEY_ID=prod-2026-q4
+export STRUCTXAI_PATCH_RECEIPT_KEY_B64="$(openssl rand -base64 32)"
+```
+
+Verification uses constant-time HMAC comparison, rejects unknown keys and stale or future-dated
+receipts, and requires one receipt per seed. The authenticated aggregate also rejects mixed model
+or tokenizer artifacts, sorts runs before hashing, and binds receipt digests to the existing
+cross-seed evidence digest.
+
 ## Interpretation and limits
 
 A smooth or monotonic dose response is useful evidence that a reported patch effect is not merely a
 single endpoint artifact. It does **not** prove that the patched state is on-manifold, that the site
 is necessary or sufficient, that the mechanism is unique, or that the candidate decision is
 semantically correct. Source and target positions remain a governed experimental choice. The
-runtime accepts one unpadded sequence per side and binds a caller-supplied model revision, but does
-not hash or authenticate model weights.
+runtime accepts one unpadded sequence per side. The authenticated wrapper can bind externally
+computed model-weight and tokenizer-bundle digests, but it does not acquire or hash those artifacts
+itself.
 
 Cross-seed agreement reduces dependence on one random run, but it does not establish statistical
-independence or prove that the declared seed was applied. Identical evidence under different labels
-is permitted because a deterministic model can legitimately reproduce bit-for-bit. Production
-provenance should bind RNG state and signed execution receipts; larger uncertainty claims should use
-more than the default three-run minimum.
+independence. The signed boundary proves that the library set Python and CPU Torch RNG states at the
+callback boundary; it cannot prove that a model used those generators, and it does not capture
+NumPy, CUDA, distributed-worker, or third-party RNGs. Receipts are freshness checked but not
+single-use. Larger uncertainty claims should use more than the default three-run minimum.
 
-The next increment is a Hugging Face adapter that records tokenizer offset mappings and model-weight
-provenance, followed by signed run receipts.
+The next increment is a Hugging Face adapter that computes model/tokenizer artifact manifests and
+captures CUDA plus distributed-worker RNG provenance before issuing the receipt.
