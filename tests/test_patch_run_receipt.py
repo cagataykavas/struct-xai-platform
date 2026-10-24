@@ -1,6 +1,7 @@
 import base64
 import random
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -134,6 +135,58 @@ def test_failed_callback_restores_rng_and_emits_no_receipt() -> None:
 
     assert random.getstate() == python_state
     assert torch.equal(torch.get_rng_state(), torch_state)
+
+
+def test_run_from_artifacts_computes_and_signs_manifests(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    tokenizer = tmp_path / "tokenizer"
+    model.mkdir()
+    tokenizer.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+    (tokenizer / "tokenizer.json").write_text('{"vocab":[]}', encoding="utf-8")
+
+    result, receipt, model_manifest, tokenizer_manifest = signer().run_from_artifacts(
+        lambda: sweep(),
+        seed=42,
+        model_path=model,
+        tokenizer_path=tokenizer,
+    )
+
+    assert receipt.model_artifact_sha256 == model_manifest.evidence_sha256
+    assert receipt.tokenizer_artifact_sha256 == tokenizer_manifest.evidence_sha256
+    verify_patch_run_receipt(
+        receipt,
+        {"primary": KEY},
+        expected_seed=42,
+        expected_sweep_evidence_sha256=result.evidence_sha256,
+        expected_model_artifact_sha256=model_manifest.evidence_sha256,
+        expected_tokenizer_artifact_sha256=tokenizer_manifest.evidence_sha256,
+        now_epoch=NOW,
+    )
+
+
+@pytest.mark.parametrize("target", ["model", "tokenizer"])
+def test_run_from_artifacts_rejects_mutation_during_callback(tmp_path: Path, target: str) -> None:
+    model = tmp_path / "model"
+    tokenizer = tmp_path / "tokenizer"
+    model.mkdir()
+    tokenizer.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+    (tokenizer / "tokenizer.json").write_bytes(b"tokens")
+
+    def mutate() -> PatchSweepResult:
+        destination = model / "model.safetensors" if target == "model" else tokenizer / "tokenizer.json"
+        destination.write_bytes(b"changed")
+        return sweep()
+
+    expected = f"{target.upper()}_ARTIFACT_CHANGED_DURING_RUN"
+    with pytest.raises(PatchRunReceiptError, match=expected):
+        signer().run_from_artifacts(
+            mutate,
+            seed=42,
+            model_path=model,
+            tokenizer_path=tokenizer,
+        )
 
 
 @pytest.mark.parametrize(
