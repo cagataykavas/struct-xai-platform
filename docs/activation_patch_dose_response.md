@@ -143,7 +143,7 @@ from structxai.patch_run_receipt import (
 )
 
 signer = PatchRunSigner.from_env()
-report, receipt = signer.run(
+report, receipt, model_manifest, tokenizer_manifest = signer.run_from_artifacts(
     lambda: run_residual_patch_sweep(
         model,
         source_input_ids=source_ids,
@@ -151,8 +151,8 @@ report, receipt = signer.run(
         spec=spec,
     ),
     seed=11,
-    model_artifact_sha256=model_weights_sha256,
-    tokenizer_artifact_sha256=tokenizer_bundle_sha256,
+    model_path="artifacts/model",
+    tokenizer_path="artifacts/tokenizer",
 )
 
 authenticated = audit_authenticated_cross_seed_dose_response(
@@ -169,6 +169,13 @@ export STRUCTXAI_PATCH_RECEIPT_KEY_ID=prod-2026-q4
 export STRUCTXAI_PATCH_RECEIPT_KEY_B64="$(openssl rand -base64 32)"
 ```
 
+Each manifest streams regular files into per-file SHA-256 commitments, sorts normalized relative
+paths, and commits the file list plus byte counts to an aggregate digest. File-count, individual-file,
+total-byte, and read-chunk limits are explicit. Empty trees, symbolic links, special files, and
+artifacts that change during hashing or callback execution fail closed. Hugging Face cache snapshots
+often contain symlinks; materialize a regular-file export with `save_pretrained` before using this
+strict boundary.
+
 Verification uses constant-time HMAC comparison, rejects unknown keys and stale or future-dated
 receipts, and requires one receipt per seed. The authenticated aggregate also rejects mixed model
 or tokenizer artifacts, sorts runs before hashing, and binds receipt digests to the existing
@@ -180,9 +187,10 @@ A smooth or monotonic dose response is useful evidence that a reported patch eff
 single endpoint artifact. It does **not** prove that the patched state is on-manifold, that the site
 is necessary or sufficient, that the mechanism is unique, or that the candidate decision is
 semantically correct. Source and target positions remain a governed experimental choice. The
-runtime accepts one unpadded sequence per side. The authenticated wrapper can bind externally
-computed model-weight and tokenizer-bundle digests, but it does not acquire or hash those artifacts
-itself.
+runtime accepts one unpadded sequence per side. The legacy signer path can still bind externally
+computed digests; production workflows should prefer `run_from_artifacts`, which computes and
+rechecks bounded manifests around the run. A manifest proves local bytes and paths, not their
+publisher, training lineage, or semantic suitability.
 
 Cross-seed agreement reduces dependence on one random run, but it does not establish statistical
 independence. The signed boundary proves that the library set Python and CPU Torch RNG states at the
@@ -190,5 +198,5 @@ callback boundary; it cannot prove that a model used those generators, and it do
 NumPy, CUDA, distributed-worker, or third-party RNGs. Receipts are freshness checked but not
 single-use. Larger uncertainty claims should use more than the default three-run minimum.
 
-The next increment is a Hugging Face adapter that computes model/tokenizer artifact manifests and
-captures CUDA plus distributed-worker RNG provenance before issuing the receipt.
+The next increment is capturing NumPy, CUDA, and distributed-worker RNG provenance before issuing
+the receipt.

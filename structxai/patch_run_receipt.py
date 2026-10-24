@@ -12,10 +12,17 @@ import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 
+from structxai.artifact_manifest import (
+    DEFAULT_ARTIFACT_MANIFEST_POLICY,
+    ArtifactManifest,
+    ArtifactManifestPolicy,
+    build_artifact_manifest,
+)
 from structxai.patch_dose_response import (
     CrossSeedPolicy,
     DoseResponseAuditPolicy,
@@ -249,6 +256,31 @@ class PatchRunSigner:
         }
         signature = hmac.new(self._key, _canonical_json(claims), hashlib.sha256).hexdigest()
         return result, PatchRunReceipt(**claims, signature=signature)  # type: ignore[arg-type]
+
+    def run_from_artifacts(
+        self,
+        callback: Callable[[], PatchSweepResult],
+        *,
+        seed: int,
+        model_path: str | Path,
+        tokenizer_path: str | Path,
+        artifact_policy: ArtifactManifestPolicy = DEFAULT_ARTIFACT_MANIFEST_POLICY,
+    ) -> tuple[PatchSweepResult, PatchRunReceipt, ArtifactManifest, ArtifactManifest]:
+        """Compute bounded artifact identities and reject mutation across the run."""
+
+        model_manifest = build_artifact_manifest(model_path, artifact_policy)
+        tokenizer_manifest = build_artifact_manifest(tokenizer_path, artifact_policy)
+        result, receipt = self.run(
+            callback,
+            seed=seed,
+            model_artifact_sha256=model_manifest.evidence_sha256,
+            tokenizer_artifact_sha256=tokenizer_manifest.evidence_sha256,
+        )
+        if build_artifact_manifest(model_path, artifact_policy) != model_manifest:
+            raise PatchRunReceiptError("MODEL_ARTIFACT_CHANGED_DURING_RUN")
+        if build_artifact_manifest(tokenizer_path, artifact_policy) != tokenizer_manifest:
+            raise PatchRunReceiptError("TOKENIZER_ARTIFACT_CHANGED_DURING_RUN")
+        return result, receipt, model_manifest, tokenizer_manifest
 
 
 def verify_patch_run_receipt(

@@ -183,7 +183,9 @@ For promotion workflows, `PatchRunSigner` now executes each sweep inside a contr
 seed boundary, restores the caller's RNG state in `finally`, and emits a fresh HMAC-SHA256 receipt.
 The receipt binds the declared seed, pre/post RNG-state digests, exact sweep evidence, immutable
 model/tokenizer artifact digests, issue time, run identity, and signing-key ID. An authenticated
-cross-seed wrapper verifies every receipt before binding them to the aggregate audit.
+cross-seed wrapper verifies every receipt before binding them to the aggregate audit. The strict
+`run_from_artifacts` path computes those model/tokenizer identities itself from bounded,
+content-addressed regular-file manifests and rejects mutation across the experiment run.
 
 ## Experiment artifact and provenance
 
@@ -259,6 +261,7 @@ structxai/
   patching.py        activation patching
   patch_dose_response.py bounded layer/dose sweeps, per-run and cross-seed audits
   patch_run_receipt.py seeded execution boundary and authenticated run provenance
+  artifact_manifest.py bounded model/tokenizer file manifests
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation
@@ -282,6 +285,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - provenance validation;
 - cross-run stability metrics;
 - activation-patch isolation, dose-response and cross-seed stability policy checks;
+- bounded model/tokenizer manifests and in-run mutation rejection;
 - HTML report generation;
 - experiment metadata lifecycle;
 - CLI/package imports;
