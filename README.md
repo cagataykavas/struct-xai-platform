@@ -179,13 +179,15 @@ recovery, non-monotonic behavior, large reversals, or unstable overshoot. A seco
 matching seed runs and rejects unstable qualification rates, effect signs, endpoints, or AUCs. See
 [`docs/activation_patch_dose_response.md`](docs/activation_patch_dose_response.md).
 
-For promotion workflows, `PatchRunSigner` now executes each sweep inside a controlled Python/Torch
-seed boundary, restores the caller's RNG state in `finally`, and emits a fresh HMAC-SHA256 receipt.
-The receipt binds the declared seed, pre/post RNG-state digests, exact sweep evidence, immutable
-model/tokenizer artifact digests, issue time, run identity, and signing-key ID. An authenticated
-cross-seed wrapper verifies every receipt before binding them to the aggregate audit. The strict
-`run_from_artifacts` path computes those model/tokenizer identities itself from bounded,
-content-addressed regular-file manifests and rejects mutation across the experiment run.
+For promotion workflows, `PatchRunSigner` now executes each sweep inside a process-serialized
+Python, NumPy, CPU Torch, and capability-aware CUDA seed boundary. It restores every caller RNG
+state in `finally`, fails closed on lock contention or CUDA topology drift, and emits a fresh
+HMAC-SHA256 receipt. Receipt schema v2 binds the declared seed, CUDA device count, pre/post
+RNG-state digests, exact sweep evidence, immutable model/tokenizer artifact digests, issue time,
+run identity, and signing-key ID. An authenticated cross-seed wrapper verifies every receipt and
+rejects mixed CUDA topologies before binding the runs to the aggregate audit. The strict
+`run_from_artifacts` path computes model/tokenizer identities from bounded, content-addressed
+regular-file manifests and rejects mutation across the experiment run.
 
 ## Experiment artifact and provenance
 

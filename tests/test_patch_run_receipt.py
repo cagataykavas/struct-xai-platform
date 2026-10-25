@@ -3,9 +3,11 @@ import random
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
+import structxai.patch_run_receipt as receipt_module
 from structxai.patch_dose_response import PatchSweepPoint, PatchSweepResult
 from structxai.patch_run_receipt import (
     PatchRunReceiptError,
@@ -60,6 +62,14 @@ def signer(run_id: str = "1" * 32) -> PatchRunSigner:
     )
 
 
+def numpy_states_equal(left: tuple, right: tuple) -> bool:
+    return (
+        left[0] == right[0]
+        and np.array_equal(left[1], right[1])
+        and left[2:] == right[2:]
+    )
+
+
 def signed_run(seed: int, result: PatchSweepResult | None = None, **kwargs):
     active_result = result or sweep()
     return signer(f"{seed:032x}").run(
@@ -72,20 +82,24 @@ def signed_run(seed: int, result: PatchSweepResult | None = None, **kwargs):
 
 def test_seeded_boundary_authenticates_run_and_restores_caller_rng_state() -> None:
     random.seed(101)
+    np.random.seed(303)
     torch.manual_seed(202)
     python_state = random.getstate()
+    numpy_state = np.random.get_state()
     torch_state = torch.get_rng_state().clone()
 
     result, receipt = signer().run(
-        lambda: (random.random(), torch.rand(4), sweep())[-1],
+        lambda: (random.random(), np.random.random(4), torch.rand(4), sweep())[-1],
         seed=42,
         model_artifact_sha256=MODEL_DIGEST,
         tokenizer_artifact_sha256=TOKENIZER_DIGEST,
     )
 
     assert random.getstate() == python_state
+    assert numpy_states_equal(np.random.get_state(), numpy_state)
     assert torch.equal(torch.get_rng_state(), torch_state)
     assert receipt.seed == 42
+    assert receipt.cuda_device_count == (torch.cuda.device_count() if torch.cuda.is_available() else 0)
     assert receipt.sweep_evidence_sha256 == result.evidence_sha256
     assert KEY.hex() not in repr(receipt)
     verify_patch_run_receipt(
@@ -109,19 +123,24 @@ def test_same_seed_reproduces_initial_rng_digests() -> None:
     )
 
     assert first.python_rng_before_sha256 == second.python_rng_before_sha256
+    assert first.numpy_rng_before_sha256 == second.numpy_rng_before_sha256
     assert first.torch_rng_before_sha256 == second.torch_rng_before_sha256
+    assert first.cuda_rng_before_sha256 == second.cuda_rng_before_sha256
     assert first.run_id != second.run_id
     assert first.signature != second.signature
 
 
 def test_failed_callback_restores_rng_and_emits_no_receipt() -> None:
     random.seed(5)
+    np.random.seed(7)
     torch.manual_seed(6)
     python_state = random.getstate()
+    numpy_state = np.random.get_state()
     torch_state = torch.get_rng_state().clone()
 
     def fail() -> PatchSweepResult:
         random.random()
+        np.random.random()
         torch.rand(1)
         raise RuntimeError("model failed")
 
@@ -134,7 +153,78 @@ def test_failed_callback_restores_rng_and_emits_no_receipt() -> None:
         )
 
     assert random.getstate() == python_state
+    assert numpy_states_equal(np.random.get_state(), numpy_state)
     assert torch.equal(torch.get_rng_state(), torch_state)
+
+
+def test_cuda_rng_state_is_seeded_hashed_and_restored_without_cuda_hardware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_states = [
+        torch.tensor([1, 2, 3], dtype=torch.uint8),
+        torch.tensor([4, 5, 6], dtype=torch.uint8),
+    ]
+    active_states = [state.clone() for state in original_states]
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [state.clone() for state in active_states])
+
+    def seed_all(seed: int) -> None:
+        active_states[:] = [
+            torch.tensor([(seed + device) % 256, 10, 20], dtype=torch.uint8)
+            for device in range(2)
+        ]
+
+    def restore_all(states: list[torch.Tensor]) -> None:
+        active_states[:] = [state.clone() for state in states]
+
+    monkeypatch.setattr(torch.cuda, "manual_seed_all", seed_all)
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", restore_all)
+
+    def consume_cuda_state() -> PatchSweepResult:
+        active_states[0][1] = 99
+        active_states[1][1] = 98
+        return sweep()
+
+    _, receipt = signer().run(
+        consume_cuda_state,
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+    )
+
+    assert receipt.cuda_device_count == 2
+    assert receipt.cuda_rng_before_sha256 != receipt.cuda_rng_after_sha256
+    assert all(torch.equal(actual, expected) for actual, expected in zip(active_states, original_states))
+
+
+def test_rng_boundary_fails_closed_when_process_lock_is_busy() -> None:
+    locked = receipt_module._RNG_LOCK.acquire(timeout=0)
+    assert locked
+    try:
+        blocked = PatchRunSigner(
+            "primary",
+            KEY,
+            clock=lambda: NOW,
+            run_id_factory=lambda: "1" * 32,
+            rng_lock_timeout_seconds=0.01,
+        )
+        with pytest.raises(PatchRunReceiptError, match="RNG_BOUNDARY_BUSY"):
+            blocked.run(
+                lambda: sweep(),
+                seed=42,
+                model_artifact_sha256=MODEL_DIGEST,
+                tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            )
+    finally:
+        receipt_module._RNG_LOCK.release()
+
+
+@pytest.mark.parametrize("timeout", [-1, float("nan"), float("inf"), True, "1"])
+def test_rng_lock_policy_rejects_invalid_timeout(timeout: object) -> None:
+    with pytest.raises(PatchRunReceiptError, match="RNG_LOCK_POLICY_INVALID"):
+        PatchRunSigner("primary", KEY, rng_lock_timeout_seconds=timeout)  # type: ignore[arg-type]
 
 
 def test_run_from_artifacts_computes_and_signs_manifests(tmp_path: Path) -> None:
@@ -306,6 +396,39 @@ def test_authenticated_cross_seed_audit_rejects_missing_or_mixed_artifacts() -> 
         audit_authenticated_cross_seed_dose_response(
             runs,
             receipts,
+            {"primary": KEY},
+            now_epoch=NOW,
+        )
+
+
+def test_authenticated_cross_seed_audit_rejects_mixed_cuda_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs = {11: sweep(0.70), 22: sweep(0.72)}
+    cpu_receipt = signed_run(11, runs[11])[1]
+    active_state = [torch.tensor([3, 4, 5], dtype=torch.uint8)]
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [active_state[0].clone()])
+    monkeypatch.setattr(
+        torch.cuda,
+        "manual_seed_all",
+        lambda seed: active_state.__setitem__(
+            0, torch.tensor([seed % 256, 4, 5], dtype=torch.uint8)
+        ),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_rng_state_all",
+        lambda states: active_state.__setitem__(0, states[0].clone()),
+    )
+    gpu_receipt = signed_run(22, runs[22])[1]
+
+    with pytest.raises(PatchRunReceiptError, match="CROSS_SEED_RNG_BACKEND_MISMATCH"):
+        audit_authenticated_cross_seed_dose_response(
+            runs,
+            {11: cpu_receipt, 22: gpu_receipt},
             {"primary": KEY},
             now_epoch=NOW,
         )

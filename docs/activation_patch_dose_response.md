@@ -131,10 +131,12 @@ mismatched runs fail separately.
 ## Authenticated seeded-run provenance
 
 Caller-provided seed labels alone do not show that a runtime actually applied the seed. The
-`PatchRunSigner` boundary seeds Python and CPU Torch immediately before the sweep callback, hashes
-the pre/post RNG states, validates the returned sweep evidence, and restores the caller's original
-states even when execution raises. Raw RNG state and secret key bytes are never copied into the
-receipt.
+`PatchRunSigner` boundary seeds Python, NumPy's legacy global generator, CPU Torch, and every
+available CUDA generator immediately before the sweep callback. It hashes the pre/post RNG states,
+validates the returned sweep evidence, and restores the caller's original states even when
+execution raises. A process-wide lock serializes this global-state boundary; callers can set a
+bounded acquisition timeout and receive `RNG_BOUNDARY_BUSY` instead of racing another run. Raw RNG
+state and secret key bytes are never copied into the receipt.
 
 ```python
 from structxai.patch_run_receipt import (
@@ -178,8 +180,10 @@ strict boundary.
 
 Verification uses constant-time HMAC comparison, rejects unknown keys and stale or future-dated
 receipts, and requires one receipt per seed. The authenticated aggregate also rejects mixed model
-or tokenizer artifacts, sorts runs before hashing, and binds receipt digests to the existing
-cross-seed evidence digest.
+or tokenizer artifacts and mixed CUDA device counts, sorts runs before hashing, and binds receipt
+digests to the existing cross-seed evidence digest. CUDA-less hosts commit a deterministic
+zero-device state, so the same receipt schema is exercised in CPU-only CI. NumPy maps the governed
+64-bit seed into the legacy generator's 32-bit seed space with modulo `2**32`.
 
 ## Interpretation and limits
 
@@ -193,10 +197,12 @@ rechecks bounded manifests around the run. A manifest proves local bytes and pat
 publisher, training lineage, or semantic suitability.
 
 Cross-seed agreement reduces dependence on one random run, but it does not establish statistical
-independence. The signed boundary proves that the library set Python and CPU Torch RNG states at the
-callback boundary; it cannot prove that a model used those generators, and it does not capture
-NumPy, CUDA, distributed-worker, or third-party RNGs. Receipts are freshness checked but not
+independence. The signed boundary proves that the library set the covered process-global RNG states
+at the callback boundary; it cannot prove that a model used those generators. Independent NumPy
+`Generator` instances, distributed data-loader workers, remote inference servers, and third-party
+RNGs remain outside the boundary. CUDA coverage is capability-aware but CPU-only CI simulates the
+multi-device API rather than executing real kernels. Receipts are freshness checked but not
 single-use. Larger uncertainty claims should use more than the default three-run minimum.
 
-The next increment is capturing NumPy, CUDA, and distributed-worker RNG provenance before issuing
-the receipt.
+The next increment is propagating authenticated per-worker seeds into distributed data-loading and
+recording the worker topology without exposing raw samples or RNG state.

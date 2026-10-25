@@ -5,16 +5,19 @@ import binascii
 import hashlib
 import hmac
 import json
+import math
 import os
 import random
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from structxai.artifact_manifest import (
@@ -32,7 +35,7 @@ from structxai.patch_dose_response import (
     audit_dose_response,
 )
 
-RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v1"
+RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v2"
 AUTHENTICATED_AUDIT_SCHEMA = "struct-xai-authenticated-cross-seed/v1"
 ALGORITHM = "HMAC-SHA256"
 PURPOSE = "activation-patch-run"
@@ -40,9 +43,11 @@ MINIMUM_KEY_BYTES = 32
 MAX_SEED = 2**63 - 1
 DEFAULT_MAX_AGE_SECONDS = 300
 DEFAULT_CLOCK_SKEW_SECONDS = 5
+DEFAULT_RNG_LOCK_TIMEOUT_SECONDS = 30.0
 KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_RNG_LOCK = threading.Lock()
 
 
 class PatchRunReceiptError(PatchSweepError):
@@ -60,10 +65,15 @@ class PatchRunReceipt:
     seed: int
     model_artifact_sha256: str
     tokenizer_artifact_sha256: str
+    cuda_device_count: int
     python_rng_before_sha256: str
+    numpy_rng_before_sha256: str
     torch_rng_before_sha256: str
+    cuda_rng_before_sha256: str
     python_rng_after_sha256: str
+    numpy_rng_after_sha256: str
     torch_rng_after_sha256: str
+    cuda_rng_after_sha256: str
     sweep_evidence_sha256: str
     signature: str
 
@@ -151,6 +161,66 @@ def _torch_rng_digest(state: torch.Tensor) -> str:
     return hashlib.sha256(bytes(state.tolist())).hexdigest()
 
 
+def _numpy_rng_digest(state: tuple[Any, ...]) -> str:
+    if len(state) != 5 or not isinstance(state[0], str) or not isinstance(state[1], np.ndarray):
+        raise PatchRunReceiptError("NUMPY_RNG_STATE_INVALID")
+    payload = {
+        "algorithm": state[0],
+        "keys": state[1].tolist(),
+        "position": state[2],
+        "has_gaussian": state[3],
+        "cached_gaussian": state[4],
+    }
+    return _digest(payload)
+
+
+def _cuda_rng_digest(states: tuple[torch.Tensor, ...], device_count: int) -> str:
+    if len(states) != device_count:
+        raise PatchRunReceiptError("CUDA_RNG_STATE_INVALID")
+    return _digest(
+        {
+            "device_count": device_count,
+            "state_sha256": [_torch_rng_digest(state) for state in states],
+        }
+    )
+
+
+def _capture_cuda_rng() -> tuple[int, tuple[torch.Tensor, ...]]:
+    if not torch.cuda.is_available():
+        return 0, ()
+    try:
+        device_count = torch.cuda.device_count()
+        states = tuple(state.clone() for state in torch.cuda.get_rng_state_all())
+    except (RuntimeError, AssertionError) as exc:
+        raise PatchRunReceiptError("CUDA_RNG_STATE_UNAVAILABLE") from exc
+    if device_count < 1 or len(states) != device_count:
+        raise PatchRunReceiptError("CUDA_RNG_STATE_INVALID")
+    for state in states:
+        _torch_rng_digest(state)
+    return device_count, states
+
+
+def _restore_rng_states(
+    python_state: tuple[Any, ...],
+    numpy_state: tuple[Any, ...],
+    torch_state: torch.Tensor,
+    cuda_states: tuple[torch.Tensor, ...],
+) -> None:
+    failures: list[Exception] = []
+    for restore in (
+        lambda: random.setstate(python_state),
+        lambda: np.random.set_state(numpy_state),
+        lambda: torch.set_rng_state(torch_state),
+        lambda: torch.cuda.set_rng_state_all(list(cuda_states)) if cuda_states else None,
+    ):
+        try:
+            restore()
+        except (RuntimeError, ValueError, TypeError, AssertionError) as exc:
+            failures.append(exc)
+    if failures:
+        raise PatchRunReceiptError("RNG_STATE_RESTORE_FAILED") from failures[0]
+
+
 def _validate_key_id(key_id: object) -> str:
     if not isinstance(key_id, str) or KEY_ID_RE.fullmatch(key_id) is None:
         raise PatchRunReceiptError("KEY_ID_INVALID")
@@ -189,11 +259,20 @@ class PatchRunSigner:
         *,
         clock: Callable[[], float] = time.time,
         run_id_factory: Callable[[], str] = lambda: secrets.token_hex(16),
+        rng_lock_timeout_seconds: float = DEFAULT_RNG_LOCK_TIMEOUT_SECONDS,
     ) -> None:
         self._key_id = _validate_key_id(key_id)
         self._key = _validate_key(key)
         self._clock = clock
         self._run_id_factory = run_id_factory
+        if (
+            isinstance(rng_lock_timeout_seconds, bool)
+            or not isinstance(rng_lock_timeout_seconds, (int, float))
+            or not math.isfinite(rng_lock_timeout_seconds)
+            or rng_lock_timeout_seconds < 0
+        ):
+            raise PatchRunReceiptError("RNG_LOCK_POLICY_INVALID")
+        self._rng_lock_timeout_seconds = float(rng_lock_timeout_seconds)
 
     @classmethod
     def from_env(cls) -> PatchRunSigner:
@@ -221,20 +300,41 @@ class PatchRunSigner:
         if not callable(callback):
             raise PatchRunReceiptError("RUN_CALLBACK_INVALID")
 
-        python_original = random.getstate()
-        torch_original = torch.get_rng_state()
+        if not _RNG_LOCK.acquire(timeout=self._rng_lock_timeout_seconds):
+            raise PatchRunReceiptError("RNG_BOUNDARY_BUSY")
         try:
-            random.seed(active_seed)
-            torch.random.default_generator.manual_seed(active_seed)
-            python_before = _python_rng_digest(random.getstate())
-            torch_before = _torch_rng_digest(torch.get_rng_state())
-            result = callback()
-            audit_dose_response(result)
-            python_after = _python_rng_digest(random.getstate())
-            torch_after = _torch_rng_digest(torch.get_rng_state())
+            python_original = random.getstate()
+            numpy_original = np.random.get_state()
+            torch_original = torch.get_rng_state()
+            cuda_device_count, cuda_original = _capture_cuda_rng()
+            try:
+                random.seed(active_seed)
+                np.random.seed(active_seed % (2**32))
+                torch.random.default_generator.manual_seed(active_seed)
+                if cuda_device_count:
+                    torch.cuda.manual_seed_all(active_seed)
+                python_before = _python_rng_digest(random.getstate())
+                numpy_before = _numpy_rng_digest(np.random.get_state())
+                torch_before = _torch_rng_digest(torch.get_rng_state())
+                cuda_before = _cuda_rng_digest(_capture_cuda_rng()[1], cuda_device_count)
+                result = callback()
+                audit_dose_response(result)
+                python_after = _python_rng_digest(random.getstate())
+                numpy_after = _numpy_rng_digest(np.random.get_state())
+                torch_after = _torch_rng_digest(torch.get_rng_state())
+                cuda_after_count, cuda_after_states = _capture_cuda_rng()
+                if cuda_after_count != cuda_device_count:
+                    raise PatchRunReceiptError("CUDA_DEVICE_SET_CHANGED_DURING_RUN")
+                cuda_after = _cuda_rng_digest(cuda_after_states, cuda_device_count)
+            finally:
+                _restore_rng_states(
+                    python_original,
+                    numpy_original,
+                    torch_original,
+                    cuda_original,
+                )
         finally:
-            random.setstate(python_original)
-            torch.set_rng_state(torch_original)
+            _RNG_LOCK.release()
 
         issued_at = _issued_at(self._clock)
         run_id = _validate_run_id(self._run_id_factory())
@@ -248,10 +348,15 @@ class PatchRunSigner:
             "seed": active_seed,
             "model_artifact_sha256": model_digest,
             "tokenizer_artifact_sha256": tokenizer_digest,
+            "cuda_device_count": cuda_device_count,
             "python_rng_before_sha256": python_before,
+            "numpy_rng_before_sha256": numpy_before,
             "torch_rng_before_sha256": torch_before,
+            "cuda_rng_before_sha256": cuda_before,
             "python_rng_after_sha256": python_after,
+            "numpy_rng_after_sha256": numpy_after,
             "torch_rng_after_sha256": torch_after,
+            "cuda_rng_after_sha256": cuda_after,
             "sweep_evidence_sha256": result.evidence_sha256,
         }
         signature = hmac.new(self._key, _canonical_json(claims), hashlib.sha256).hexdigest()
@@ -306,6 +411,8 @@ def verify_patch_run_receipt(
         or not isinstance(receipt.run_id, str)
         or RUN_ID_RE.fullmatch(receipt.run_id) is None
         or type(receipt.issued_at_epoch) is not int
+        or type(receipt.cuda_device_count) is not int
+        or receipt.cuda_device_count < 0
     ):
         raise PatchRunReceiptError("RECEIPT_SCHEMA_INVALID")
     _validate_key_id(receipt.key_id)
@@ -314,9 +421,13 @@ def verify_patch_run_receipt(
         receipt.model_artifact_sha256,
         receipt.tokenizer_artifact_sha256,
         receipt.python_rng_before_sha256,
+        receipt.numpy_rng_before_sha256,
         receipt.torch_rng_before_sha256,
+        receipt.cuda_rng_before_sha256,
         receipt.python_rng_after_sha256,
+        receipt.numpy_rng_after_sha256,
         receipt.torch_rng_after_sha256,
+        receipt.cuda_rng_after_sha256,
         receipt.sweep_evidence_sha256,
         receipt.signature,
     ):
@@ -391,6 +502,7 @@ def audit_authenticated_cross_seed_dose_response(
     ordered = tuple(sorted(runs))
     authenticated_runs: list[AuthenticatedSeedRun] = []
     artifact_identity: tuple[str, str] | None = None
+    cuda_device_count: int | None = None
     for seed in ordered:
         result = runs[seed]
         receipt = receipts[seed]
@@ -411,6 +523,10 @@ def audit_authenticated_cross_seed_dose_response(
             artifact_identity = current_identity
         elif current_identity != artifact_identity:
             raise PatchRunReceiptError("CROSS_SEED_ARTIFACT_MISMATCH")
+        if cuda_device_count is None:
+            cuda_device_count = receipt.cuda_device_count
+        elif receipt.cuda_device_count != cuda_device_count:
+            raise PatchRunReceiptError("CROSS_SEED_RNG_BACKEND_MISMATCH")
         authenticated_runs.append(AuthenticatedSeedRun(seed=seed, receipt_sha256=_digest(receipt.as_dict())))
 
     if artifact_identity is None:
