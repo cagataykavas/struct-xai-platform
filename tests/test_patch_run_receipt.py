@@ -15,6 +15,7 @@ from structxai.patch_run_receipt import (
     audit_authenticated_cross_seed_dose_response,
     verify_patch_run_receipt,
 )
+from structxai.worker_seeding import build_worker_seed_plan
 
 KEY = b"k" * 32
 NOW = 1_800_000_000
@@ -429,6 +430,106 @@ def test_authenticated_cross_seed_audit_rejects_mixed_cuda_topology(
         audit_authenticated_cross_seed_dose_response(
             runs,
             {11: cpu_receipt, 22: gpu_receipt},
+            {"primary": KEY},
+            now_epoch=NOW,
+        )
+
+
+def test_worker_plan_is_applied_and_authenticated() -> None:
+    observed: dict[str, float] = {}
+
+    def callback(initializer) -> PatchSweepResult:
+        initializer(1)
+        observed["python"] = random.random()
+        observed["numpy"] = float(np.random.random())
+        observed["torch"] = float(torch.rand(1).item())
+        return sweep()
+
+    result, receipt = signer().run_with_worker_plan(
+        callback,
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=2,
+        rank=1,
+        workers_per_rank=2,
+        epoch=3,
+    )
+    plan = build_worker_seed_plan(42, world_size=2, rank=1, workers_per_rank=2, epoch=3)
+
+    assert set(observed) == {"python", "numpy", "torch"}
+    assert receipt.worker_seed_manifest_sha256 == plan.manifest.evidence_sha256
+    assert (
+        receipt.worker_world_size,
+        receipt.worker_rank,
+        receipt.workers_per_rank,
+        receipt.worker_epoch,
+    ) == (2, 1, 2, 3)
+    assert all(str(entry.seed) not in repr(receipt) for entry in plan.initializer.entries)
+    verify_patch_run_receipt(
+        receipt,
+        {"primary": KEY},
+        expected_seed=42,
+        expected_sweep_evidence_sha256=result.evidence_sha256,
+        expected_model_artifact_sha256=MODEL_DIGEST,
+        expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        expected_worker_seed_manifest_sha256=plan.manifest.evidence_sha256,
+        expected_worker_topology=(2, 1, 2, 3),
+        now_epoch=NOW,
+    )
+
+
+def test_worker_manifest_tampering_breaks_signature() -> None:
+    _, receipt = signer().run_with_worker_plan(
+        lambda _initializer: sweep(),
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=2,
+    )
+
+    with pytest.raises(PatchRunReceiptError, match="RECEIPT_SIGNATURE_INVALID"):
+        verify_patch_run_receipt(
+            replace(receipt, worker_seed_manifest_sha256="9" * 64),
+            {"primary": KEY},
+            expected_seed=42,
+            expected_sweep_evidence_sha256=receipt.sweep_evidence_sha256,
+            expected_model_artifact_sha256=MODEL_DIGEST,
+            expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            now_epoch=NOW,
+        )
+
+
+def test_authenticated_cross_seed_audit_rejects_mixed_worker_topology() -> None:
+    runs = {11: sweep(0.70), 22: sweep(0.72)}
+    _, first = signer("1" * 32).run_with_worker_plan(
+        lambda _initializer: runs[11],
+        seed=11,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=2,
+    )
+    _, second = signer("2" * 32).run_with_worker_plan(
+        lambda _initializer: runs[22],
+        seed=22,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=3,
+    )
+
+    with pytest.raises(
+        PatchRunReceiptError,
+        match="CROSS_SEED_WORKER_TOPOLOGY_MISMATCH",
+    ):
+        audit_authenticated_cross_seed_dose_response(
+            runs,
+            {11: first, 22: second},
             {"primary": KEY},
             now_epoch=NOW,
         )

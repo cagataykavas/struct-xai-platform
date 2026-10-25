@@ -34,8 +34,15 @@ from structxai.patch_dose_response import (
     audit_cross_seed_dose_response,
     audit_dose_response,
 )
+from structxai.worker_seeding import (
+    WorkerSeedError,
+    WorkerSeedInitializer,
+    WorkerSeedPlan,
+    build_worker_seed_plan,
+    verify_worker_seed_plan,
+)
 
-RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v2"
+RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v3"
 AUTHENTICATED_AUDIT_SCHEMA = "struct-xai-authenticated-cross-seed/v1"
 ALGORITHM = "HMAC-SHA256"
 PURPOSE = "activation-patch-run"
@@ -66,6 +73,11 @@ class PatchRunReceipt:
     model_artifact_sha256: str
     tokenizer_artifact_sha256: str
     cuda_device_count: int
+    worker_world_size: int
+    worker_rank: int
+    workers_per_rank: int
+    worker_epoch: int
+    worker_seed_manifest_sha256: str
     python_rng_before_sha256: str
     numpy_rng_before_sha256: str
     torch_rng_before_sha256: str
@@ -293,12 +305,32 @@ class PatchRunSigner:
         seed: int,
         model_artifact_sha256: str,
         tokenizer_artifact_sha256: str,
+        _worker_seed_plan: WorkerSeedPlan | None = None,
     ) -> tuple[PatchSweepResult, PatchRunReceipt]:
         active_seed = _validate_seed(seed)
         model_digest = _validate_digest(model_artifact_sha256, "MODEL_ARTIFACT_DIGEST_INVALID")
         tokenizer_digest = _validate_digest(tokenizer_artifact_sha256, "TOKENIZER_ARTIFACT_DIGEST_INVALID")
         if not callable(callback):
             raise PatchRunReceiptError("RUN_CALLBACK_INVALID")
+        if _worker_seed_plan is None:
+            worker_world_size = 1
+            worker_rank = 0
+            workers_per_rank = 0
+            worker_epoch = 0
+            worker_seed_manifest_sha256 = _digest(
+                {
+                    "schema_version": "struct-xai-worker-seed-manifest/none",
+                    "root_seed": active_seed,
+                }
+            )
+        else:
+            if not verify_worker_seed_plan(_worker_seed_plan, active_seed):
+                raise PatchRunReceiptError("WORKER_SEED_PLAN_INVALID")
+            worker_world_size = _worker_seed_plan.manifest.world_size
+            worker_rank = _worker_seed_plan.rank
+            workers_per_rank = _worker_seed_plan.manifest.workers_per_rank
+            worker_epoch = _worker_seed_plan.manifest.epoch
+            worker_seed_manifest_sha256 = _worker_seed_plan.manifest.evidence_sha256
 
         if not _RNG_LOCK.acquire(timeout=self._rng_lock_timeout_seconds):
             raise PatchRunReceiptError("RNG_BOUNDARY_BUSY")
@@ -349,6 +381,11 @@ class PatchRunSigner:
             "model_artifact_sha256": model_digest,
             "tokenizer_artifact_sha256": tokenizer_digest,
             "cuda_device_count": cuda_device_count,
+            "worker_world_size": worker_world_size,
+            "worker_rank": worker_rank,
+            "workers_per_rank": workers_per_rank,
+            "worker_epoch": worker_epoch,
+            "worker_seed_manifest_sha256": worker_seed_manifest_sha256,
             "python_rng_before_sha256": python_before,
             "numpy_rng_before_sha256": numpy_before,
             "torch_rng_before_sha256": torch_before,
@@ -361,6 +398,40 @@ class PatchRunSigner:
         }
         signature = hmac.new(self._key, _canonical_json(claims), hashlib.sha256).hexdigest()
         return result, PatchRunReceipt(**claims, signature=signature)  # type: ignore[arg-type]
+
+    def run_with_worker_plan(
+        self,
+        callback: Callable[[WorkerSeedInitializer], PatchSweepResult],
+        *,
+        seed: int,
+        model_artifact_sha256: str,
+        tokenizer_artifact_sha256: str,
+        world_size: int,
+        rank: int,
+        workers_per_rank: int,
+        epoch: int = 0,
+    ) -> tuple[PatchSweepResult, PatchRunReceipt]:
+        """Provide a deterministic DataLoader initializer and authenticate its topology."""
+
+        if not callable(callback):
+            raise PatchRunReceiptError("RUN_CALLBACK_INVALID")
+        try:
+            plan = build_worker_seed_plan(
+                seed,
+                world_size=world_size,
+                rank=rank,
+                workers_per_rank=workers_per_rank,
+                epoch=epoch,
+            )
+        except WorkerSeedError as exc:
+            raise PatchRunReceiptError(str(exc)) from exc
+        return self.run(
+            lambda: callback(plan.initializer),
+            seed=seed,
+            model_artifact_sha256=model_artifact_sha256,
+            tokenizer_artifact_sha256=tokenizer_artifact_sha256,
+            _worker_seed_plan=plan,
+        )
 
     def run_from_artifacts(
         self,
@@ -396,6 +467,8 @@ def verify_patch_run_receipt(
     expected_sweep_evidence_sha256: str,
     expected_model_artifact_sha256: str,
     expected_tokenizer_artifact_sha256: str,
+    expected_worker_seed_manifest_sha256: str | None = None,
+    expected_worker_topology: tuple[int, int, int, int] | None = None,
     now_epoch: int | None = None,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
     clock_skew_seconds: int = DEFAULT_CLOCK_SKEW_SECONDS,
@@ -413,6 +486,14 @@ def verify_patch_run_receipt(
         or type(receipt.issued_at_epoch) is not int
         or type(receipt.cuda_device_count) is not int
         or receipt.cuda_device_count < 0
+        or type(receipt.worker_world_size) is not int
+        or receipt.worker_world_size < 1
+        or type(receipt.worker_rank) is not int
+        or not 0 <= receipt.worker_rank < receipt.worker_world_size
+        or type(receipt.workers_per_rank) is not int
+        or receipt.workers_per_rank < 0
+        or type(receipt.worker_epoch) is not int
+        or receipt.worker_epoch < 0
     ):
         raise PatchRunReceiptError("RECEIPT_SCHEMA_INVALID")
     _validate_key_id(receipt.key_id)
@@ -428,6 +509,7 @@ def verify_patch_run_receipt(
         receipt.numpy_rng_after_sha256,
         receipt.torch_rng_after_sha256,
         receipt.cuda_rng_after_sha256,
+        receipt.worker_seed_manifest_sha256,
         receipt.sweep_evidence_sha256,
         receipt.signature,
     ):
@@ -463,6 +545,29 @@ def verify_patch_run_receipt(
         )
     ):
         raise PatchRunReceiptError("RECEIPT_BINDING_MISMATCH")
+    if expected_worker_seed_manifest_sha256 is not None and not hmac.compare_digest(
+        receipt.worker_seed_manifest_sha256,
+        _validate_digest(
+            expected_worker_seed_manifest_sha256,
+            "WORKER_SEED_MANIFEST_DIGEST_INVALID",
+        ),
+    ):
+        raise PatchRunReceiptError("RECEIPT_BINDING_MISMATCH")
+    if expected_worker_topology is not None:
+        if (
+            not isinstance(expected_worker_topology, tuple)
+            or len(expected_worker_topology) != 4
+            or any(type(value) is not int for value in expected_worker_topology)
+        ):
+            raise PatchRunReceiptError("WORKER_TOPOLOGY_EXPECTATION_INVALID")
+        actual_topology = (
+            receipt.worker_world_size,
+            receipt.worker_rank,
+            receipt.workers_per_rank,
+            receipt.worker_epoch,
+        )
+        if actual_topology != expected_worker_topology:
+            raise PatchRunReceiptError("RECEIPT_BINDING_MISMATCH")
 
     if (
         type(max_age_seconds) is not int
@@ -503,6 +608,7 @@ def audit_authenticated_cross_seed_dose_response(
     authenticated_runs: list[AuthenticatedSeedRun] = []
     artifact_identity: tuple[str, str] | None = None
     cuda_device_count: int | None = None
+    worker_topology: tuple[int, int, int, int] | None = None
     for seed in ordered:
         result = runs[seed]
         receipt = receipts[seed]
@@ -527,6 +633,16 @@ def audit_authenticated_cross_seed_dose_response(
             cuda_device_count = receipt.cuda_device_count
         elif receipt.cuda_device_count != cuda_device_count:
             raise PatchRunReceiptError("CROSS_SEED_RNG_BACKEND_MISMATCH")
+        current_worker_topology = (
+            receipt.worker_world_size,
+            receipt.worker_rank,
+            receipt.workers_per_rank,
+            receipt.worker_epoch,
+        )
+        if worker_topology is None:
+            worker_topology = current_worker_topology
+        elif current_worker_topology != worker_topology:
+            raise PatchRunReceiptError("CROSS_SEED_WORKER_TOPOLOGY_MISMATCH")
         authenticated_runs.append(AuthenticatedSeedRun(seed=seed, receipt_sha256=_digest(receipt.as_dict())))
 
     if artifact_identity is None:
