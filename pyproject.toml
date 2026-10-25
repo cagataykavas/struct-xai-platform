@@ -9,6 +9,7 @@ description = "Compact layer-wise interpretability toolkit and experiment servic
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.116",
+  "numpy>=1.26",
   "pydantic>=2.11",
   "torch>=2.2",
   "transformers>=4.50",
