@@ -182,10 +182,15 @@ matching seed runs and rejects unstable qualification rates, effect signs, endpo
 For promotion workflows, `PatchRunSigner` now executes each sweep inside a process-serialized
 Python, NumPy, CPU Torch, and capability-aware CUDA seed boundary. It restores every caller RNG
 state in `finally`, fails closed on lock contention or CUDA topology drift, and emits a fresh
-HMAC-SHA256 receipt. Receipt schema v2 binds the declared seed, CUDA device count, pre/post
+HMAC-SHA256 receipt. Receipt schema v3 binds the declared seed, CUDA device count, pre/post
 RNG-state digests, exact sweep evidence, immutable model/tokenizer artifact digests, issue time,
-run identity, and signing-key ID. An authenticated cross-seed wrapper verifies every receipt and
-rejects mixed CUDA topologies before binding the runs to the aggregate audit. The strict
+run identity, signing-key ID, and optional distributed-worker seed topology. The
+`run_with_worker_plan` path supplies a picklable DataLoader initializer for Python,
+NumPy, and CPU Torch in every local worker while committing all rank/worker seeds as
+privacy-reduced hashes. An authenticated cross-seed wrapper verifies every receipt and
+rejects mixed CUDA or worker topologies before binding the runs to the aggregate audit. See
+[`docs/distributed-worker-seeding.md`](docs/distributed-worker-seeding.md) for the
+DataLoader contract and persistent-worker limitation. The strict
 `run_from_artifacts` path computes model/tokenizer identities from bounded, content-addressed
 regular-file manifests and rejects mutation across the experiment run.
 
@@ -263,6 +268,7 @@ structxai/
   patching.py        activation patching
   patch_dose_response.py bounded layer/dose sweeps, per-run and cross-seed audits
   patch_run_receipt.py seeded execution boundary and authenticated run provenance
+  worker_seeding.py  distributed DataLoader seed plans and topology manifests
   artifact_manifest.py bounded model/tokenizer file manifests
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
@@ -288,6 +294,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - cross-run stability metrics;
 - activation-patch isolation, dose-response and cross-seed stability policy checks;
 - bounded model/tokenizer manifests and in-run mutation rejection;
+- deterministic distributed-worker seed plans and authenticated topology binding;
 - HTML report generation;
 - experiment metadata lifecycle;
 - CLI/package imports;
