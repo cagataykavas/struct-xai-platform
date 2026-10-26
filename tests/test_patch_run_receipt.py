@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import structxai.patch_run_receipt as receipt_module
+from structxai.dataset_manifest import DatasetExample, build_dataset_manifest
 from structxai.patch_dose_response import PatchSweepPoint, PatchSweepResult
 from structxai.patch_run_receipt import (
     PatchRunReceiptError,
@@ -522,6 +523,74 @@ def test_input_plan_drives_dataloader_and_is_authenticated() -> None:
     )
 
 
+def test_input_plan_binds_exact_dataset_contents_to_signed_receipt() -> None:
+    values = [
+        DatasetExample("example-1", b"first payload"),
+        DatasetExample("example-2", b"second payload"),
+        DatasetExample("example-3", b"third payload"),
+    ]
+    dataset_manifest = build_dataset_manifest(values)
+
+    result, receipt = signer().run_with_input_plan(
+        lambda _initializer, _sampler: sweep(),
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+        dataset_size=3,
+        dataset_examples=values,
+    )
+    plan = build_distributed_sampler_plan(
+        42,
+        world_size=1,
+        rank=0,
+        dataset_size=3,
+        dataset_manifest=dataset_manifest,
+    )
+
+    assert receipt.dataset_bound is True
+    assert receipt.dataset_manifest_sha256 == dataset_manifest.evidence_sha256
+    assert receipt.sampler_manifest_sha256 == plan.manifest.evidence_sha256
+    assert "first payload" not in repr(receipt)
+    verify_patch_run_receipt(
+        receipt,
+        {"primary": KEY},
+        expected_seed=42,
+        expected_sweep_evidence_sha256=result.evidence_sha256,
+        expected_model_artifact_sha256=MODEL_DIGEST,
+        expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        expected_sampler_manifest_sha256=plan.manifest.evidence_sha256,
+        expected_dataset_manifest_sha256=dataset_manifest.evidence_sha256,
+        now_epoch=NOW,
+    )
+
+
+def test_dataset_mutation_during_callback_fails_closed() -> None:
+    values = [
+        DatasetExample("example-1", b"first payload"),
+        DatasetExample("example-2", b"second payload"),
+    ]
+
+    def mutate(_initializer, _sampler) -> PatchSweepResult:
+        values[0] = DatasetExample("example-1", b"changed payload")
+        return sweep()
+
+    with pytest.raises(PatchRunReceiptError, match="DATASET_CHANGED_DURING_RUN"):
+        signer().run_with_input_plan(
+            mutate,
+            seed=42,
+            model_artifact_sha256=MODEL_DIGEST,
+            tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            world_size=1,
+            rank=0,
+            workers_per_rank=1,
+            dataset_size=2,
+            dataset_examples=values,
+        )
+
+
 def test_input_plan_mutation_during_callback_fails_closed() -> None:
     def mutate(_initializer, sampler) -> PatchSweepResult:
         object.__setattr__(sampler, "indices", tuple(reversed(sampler.indices)))
@@ -568,6 +637,35 @@ def test_sampler_manifest_tampering_breaks_signature() -> None:
         )
 
 
+def test_dataset_manifest_tampering_breaks_signature() -> None:
+    values = [
+        DatasetExample("example-1", b"first payload"),
+        DatasetExample("example-2", b"second payload"),
+    ]
+    _, receipt = signer().run_with_input_plan(
+        lambda _initializer, _sampler: sweep(),
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+        dataset_size=2,
+        dataset_examples=values,
+    )
+
+    with pytest.raises(PatchRunReceiptError, match="RECEIPT_SIGNATURE_INVALID"):
+        verify_patch_run_receipt(
+            replace(receipt, dataset_manifest_sha256="9" * 64),
+            {"primary": KEY},
+            expected_seed=42,
+            expected_sweep_evidence_sha256=receipt.sweep_evidence_sha256,
+            expected_model_artifact_sha256=MODEL_DIGEST,
+            expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            now_epoch=NOW,
+        )
+
+
 def test_unbound_run_cannot_satisfy_expected_sampler_manifest() -> None:
     result, receipt = signer().run(
         sweep,
@@ -585,6 +683,27 @@ def test_unbound_run_cannot_satisfy_expected_sampler_manifest() -> None:
             expected_model_artifact_sha256=MODEL_DIGEST,
             expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
             expected_sampler_manifest_sha256=receipt.sampler_manifest_sha256,
+            now_epoch=NOW,
+        )
+
+
+def test_unbound_run_cannot_satisfy_expected_dataset_manifest() -> None:
+    result, receipt = signer().run(
+        sweep,
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+    )
+
+    with pytest.raises(PatchRunReceiptError, match="RECEIPT_BINDING_MISMATCH"):
+        verify_patch_run_receipt(
+            receipt,
+            {"primary": KEY},
+            expected_seed=42,
+            expected_sweep_evidence_sha256=result.evidence_sha256,
+            expected_model_artifact_sha256=MODEL_DIGEST,
+            expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            expected_dataset_manifest_sha256=receipt.dataset_manifest_sha256,
             now_epoch=NOW,
         )
 
@@ -674,6 +793,48 @@ def test_authenticated_cross_seed_audit_rejects_mixed_sampler_boundary() -> None
         audit_authenticated_cross_seed_dose_response(
             runs,
             {11: worker_only, 22: input_bound},
+            {"primary": KEY},
+            now_epoch=NOW,
+        )
+
+
+def test_authenticated_cross_seed_audit_rejects_different_dataset_contents() -> None:
+    runs = {11: sweep(0.70), 22: sweep(0.72)}
+    first_dataset = [
+        DatasetExample("example-1", b"first payload"),
+        DatasetExample("example-2", b"second payload"),
+    ]
+    second_dataset = [
+        DatasetExample("example-1", b"changed payload"),
+        DatasetExample("example-2", b"second payload"),
+    ]
+    _, first = signer("1" * 32).run_with_input_plan(
+        lambda _initializer, _sampler: runs[11],
+        seed=11,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+        dataset_size=2,
+        dataset_examples=first_dataset,
+    )
+    _, second = signer("2" * 32).run_with_input_plan(
+        lambda _initializer, _sampler: runs[22],
+        seed=22,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+        dataset_size=2,
+        dataset_examples=second_dataset,
+    )
+
+    with pytest.raises(PatchRunReceiptError, match="CROSS_SEED_DATASET_MISMATCH"):
+        audit_authenticated_cross_seed_dose_response(
+            runs,
+            {11: first, 22: second},
             {"primary": KEY},
             now_epoch=NOW,
         )

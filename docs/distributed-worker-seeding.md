@@ -41,6 +41,13 @@ global manifest commits every rank's exact order without publishing raw sample
 indices:
 
 ```python
+from structxai.dataset_manifest import DatasetExample
+
+dataset_examples = [
+    DatasetExample(example_id=row.id, payload=canonical_json(row).encode("utf-8"))
+    for row in dataset
+]
+
 result, receipt = signer.run_with_input_plan(
     lambda worker_init_fn, sampler: run_patch_sweep(
         DataLoader(
@@ -59,6 +66,7 @@ result, receipt = signer.run_with_input_plan(
     rank=0,
     workers_per_rank=4,
     dataset_size=len(dataset),
+    dataset_examples=dataset_examples,
     epoch=3,
     shuffle=True,
     drop_last=False,
@@ -67,25 +75,31 @@ result, receipt = signer.run_with_input_plan(
 
 The plan uses a domain-separated permutation seed, deterministic rank striding,
 and explicit padding or truncation. It records dataset size, epoch, shuffle and
-drop-last policy, per-rank counts, and per-rank order digests. Plans are capped at
-one million samples and 1,024 ranks. The signer rebuilds the plan both before and
-after the callback, so in-run sampler mutation prevents receipt issuance.
+drop-last policy, per-rank counts, and per-rank order digests. When
+`dataset_examples` is provided, the sampler manifest also commits the ordered
+SHA-256 hashes of each caller-canonicalized example ID and payload. Raw IDs and
+payloads never enter the manifest. Plans are capped at one million samples and
+1,024 ranks; payloads are capped at 16 MiB per example and 50 GiB in total. The
+signer rebuilds both plans around the callback, so in-run sampler or dataset
+mutation prevents receipt issuance.
 
 ## Receipt contract
 
-Receipt schema v4 binds:
+Receipt schema v5 binds:
 
 - world size and local rank;
 - workers per rank and epoch;
 - a canonical SHA-256 manifest covering every rank/worker seed commitment;
 - an optional canonical distributed-sampler manifest covering every rank's order;
+- an optional ordered dataset-content manifest nested into the sampler manifest;
 - the existing root seed, model/tokenizer artifacts, backend RNG state, and sweep
   evidence.
 
 The manifest publishes only SHA-256 seed commitments, never raw worker seeds. Every
 rank derives the same global manifest while receiving only its own initializer
-entries. Cross-seed promotion rejects mixed worker topology, and online verification
-can require both the exact manifest digest and expected topology.
+entries. Cross-seed promotion rejects mixed worker topology or dataset identity,
+and online verification can require exact worker, sampler, and dataset manifest
+digests plus expected topology.
 
 ## Boundaries
 
@@ -94,8 +108,10 @@ cannot prove that arbitrary callback code attached it to every DataLoader. It do
 not seed independent NumPy `Generator` instances, remote services, custom native
 extensions, or native-library RNGs. The governed input-plan path supplies both the
 initializer and sampler, but arbitrary callback code can still ignore them. Dataset
-contents are not authenticated: the manifest proves the order of integer positions
-for a declared dataset size, not what samples occupied those positions.
+binding proves only that caller-supplied canonical bytes stayed stable; it does not
+prove semantic correctness, provenance, or that callback code consumed those exact
+objects. SHA-256 commitments also hide values but do not anonymize low-entropy IDs
+or payloads against guessing attacks.
 
 With `persistent_workers=True`, PyTorch does not recreate workers each epoch. Use a
 new loader per governed epoch or an explicit worker reseeding protocol; changing the

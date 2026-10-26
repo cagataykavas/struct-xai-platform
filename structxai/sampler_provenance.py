@@ -7,7 +7,9 @@ from dataclasses import asdict, dataclass
 import torch
 from torch.utils.data import Sampler
 
-SAMPLER_MANIFEST_SCHEMA = "struct-xai-distributed-sampler/v1"
+from structxai.dataset_manifest import DatasetManifest, validate_dataset_manifest
+
+SAMPLER_MANIFEST_SCHEMA = "struct-xai-distributed-sampler/v2"
 MAX_SEED = 2**63 - 1
 MAX_WORLD_SIZE = 1_024
 MAX_DATASET_SIZE = 1_000_000
@@ -29,6 +31,8 @@ class SamplerManifest:
     schema_version: str
     world_size: int
     dataset_size: int
+    dataset_bound: bool
+    dataset_manifest_sha256: str
     epoch: int
     shuffle: bool
     drop_last: bool
@@ -42,6 +46,8 @@ class SamplerManifest:
             "schema_version": self.schema_version,
             "world_size": self.world_size,
             "dataset_size": self.dataset_size,
+            "dataset_bound": self.dataset_bound,
+            "dataset_manifest_sha256": self.dataset_manifest_sha256,
             "epoch": self.epoch,
             "shuffle": self.shuffle,
             "drop_last": self.drop_last,
@@ -72,6 +78,7 @@ class DistributedSamplerPlan:
     rank: int
     manifest: SamplerManifest
     sampler: DeterministicRankSampler
+    dataset_manifest: DatasetManifest | None = None
 
 
 def _canonical_json(value: object) -> bytes:
@@ -131,6 +138,7 @@ def build_distributed_sampler_plan(
     epoch: int = 0,
     shuffle: bool = True,
     drop_last: bool = False,
+    dataset_manifest: DatasetManifest | None = None,
 ) -> DistributedSamplerPlan:
     """Build a shared order manifest and one immutable rank-local sampler."""
 
@@ -168,6 +176,21 @@ def build_distributed_sampler_plan(
         raise SamplerPlanError("SAMPLER_SHUFFLE_INVALID")
     if type(drop_last) is not bool:
         raise SamplerPlanError("SAMPLER_DROP_LAST_INVALID")
+    if dataset_manifest is None:
+        dataset_bound = False
+        dataset_manifest_sha256 = _digest(
+            {
+                "schema_version": "struct-xai-dataset-manifest/none",
+                "dataset_size": active_dataset_size,
+            }
+        )
+    else:
+        if not validate_dataset_manifest(dataset_manifest):
+            raise SamplerPlanError("SAMPLER_DATASET_MANIFEST_INVALID")
+        if dataset_manifest.dataset_size != active_dataset_size:
+            raise SamplerPlanError("SAMPLER_DATASET_SIZE_MISMATCH")
+        dataset_bound = True
+        dataset_manifest_sha256 = dataset_manifest.evidence_sha256
 
     if drop_last:
         samples_per_rank = active_dataset_size // active_world_size
@@ -202,6 +225,8 @@ def build_distributed_sampler_plan(
         "schema_version": SAMPLER_MANIFEST_SCHEMA,
         "world_size": active_world_size,
         "dataset_size": active_dataset_size,
+        "dataset_bound": dataset_bound,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
         "epoch": active_epoch,
         "shuffle": shuffle,
         "drop_last": drop_last,
@@ -213,6 +238,8 @@ def build_distributed_sampler_plan(
         schema_version=SAMPLER_MANIFEST_SCHEMA,
         world_size=active_world_size,
         dataset_size=active_dataset_size,
+        dataset_bound=dataset_bound,
+        dataset_manifest_sha256=dataset_manifest_sha256,
         epoch=active_epoch,
         shuffle=shuffle,
         drop_last=drop_last,
@@ -225,6 +252,7 @@ def build_distributed_sampler_plan(
         rank=active_rank,
         manifest=manifest,
         sampler=DeterministicRankSampler(rank_indices[active_rank]),
+        dataset_manifest=dataset_manifest,
     )
 
 
@@ -245,6 +273,7 @@ def verify_distributed_sampler_plan(
             epoch=plan.manifest.epoch,
             shuffle=plan.manifest.shuffle,
             drop_last=plan.manifest.drop_last,
+            dataset_manifest=plan.dataset_manifest,
         )
     except SamplerPlanError:
         return False
