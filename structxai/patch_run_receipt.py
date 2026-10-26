@@ -12,7 +12,7 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,12 @@ from structxai.artifact_manifest import (
     ArtifactManifest,
     ArtifactManifestPolicy,
     build_artifact_manifest,
+)
+from structxai.dataset_manifest import (
+    DatasetExample,
+    DatasetManifestError,
+    build_dataset_manifest,
+    verify_dataset_manifest,
 )
 from structxai.patch_dose_response import (
     CrossSeedPolicy,
@@ -49,7 +55,7 @@ from structxai.worker_seeding import (
     verify_worker_seed_plan,
 )
 
-RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v4"
+RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v5"
 AUTHENTICATED_AUDIT_SCHEMA = "struct-xai-authenticated-cross-seed/v1"
 ALGORITHM = "HMAC-SHA256"
 PURPOSE = "activation-patch-run"
@@ -87,6 +93,8 @@ class PatchRunReceipt:
     worker_seed_manifest_sha256: str
     sampler_bound: bool
     sampler_manifest_sha256: str
+    dataset_bound: bool
+    dataset_manifest_sha256: str
     python_rng_before_sha256: str
     numpy_rng_before_sha256: str
     torch_rng_before_sha256: str
@@ -349,11 +357,19 @@ class PatchRunSigner:
                     "root_seed": active_seed,
                 }
             )
+            dataset_bound = False
+            dataset_manifest_sha256 = _digest(
+                {
+                    "schema_version": "struct-xai-dataset-manifest/none",
+                }
+            )
         else:
             if not verify_distributed_sampler_plan(_sampler_plan, active_seed):
                 raise PatchRunReceiptError("SAMPLER_PLAN_INVALID")
             sampler_bound = True
             sampler_manifest_sha256 = _sampler_plan.manifest.evidence_sha256
+            dataset_bound = _sampler_plan.manifest.dataset_bound
+            dataset_manifest_sha256 = _sampler_plan.manifest.dataset_manifest_sha256
 
         if not _RNG_LOCK.acquire(timeout=self._rng_lock_timeout_seconds):
             raise PatchRunReceiptError("RNG_BOUNDARY_BUSY")
@@ -416,6 +432,8 @@ class PatchRunSigner:
             "worker_seed_manifest_sha256": worker_seed_manifest_sha256,
             "sampler_bound": sampler_bound,
             "sampler_manifest_sha256": sampler_manifest_sha256,
+            "dataset_bound": dataset_bound,
+            "dataset_manifest_sha256": dataset_manifest_sha256,
             "python_rng_before_sha256": python_before,
             "numpy_rng_before_sha256": numpy_before,
             "torch_rng_before_sha256": torch_before,
@@ -477,12 +495,16 @@ class PatchRunSigner:
         epoch: int = 0,
         shuffle: bool = True,
         drop_last: bool = False,
+        dataset_examples: Sequence[DatasetExample] | None = None,
     ) -> tuple[PatchSweepResult, PatchRunReceipt]:
-        """Supply authenticated worker seeds and an immutable distributed sample order."""
+        """Supply authenticated worker seeds and a content-bound distributed sample order."""
 
         if not callable(callback):
             raise PatchRunReceiptError("RUN_CALLBACK_INVALID")
         try:
+            dataset_manifest = (
+                build_dataset_manifest(dataset_examples) if dataset_examples is not None else None
+            )
             worker_plan = build_worker_seed_plan(
                 seed,
                 world_size=world_size,
@@ -498,11 +520,21 @@ class PatchRunSigner:
                 epoch=epoch,
                 shuffle=shuffle,
                 drop_last=drop_last,
+                dataset_manifest=dataset_manifest,
             )
-        except (WorkerSeedError, SamplerPlanError) as exc:
+        except (DatasetManifestError, WorkerSeedError, SamplerPlanError) as exc:
             raise PatchRunReceiptError(str(exc)) from exc
+
+        def run_with_dataset_boundary() -> PatchSweepResult:
+            result = callback(worker_plan.initializer, sampler_plan.sampler)
+            if dataset_manifest is not None and (
+                dataset_examples is None or not verify_dataset_manifest(dataset_manifest, dataset_examples)
+            ):
+                raise PatchRunReceiptError("DATASET_CHANGED_DURING_RUN")
+            return result
+
         return self.run(
-            lambda: callback(worker_plan.initializer, sampler_plan.sampler),
+            run_with_dataset_boundary,
             seed=seed,
             model_artifact_sha256=model_artifact_sha256,
             tokenizer_artifact_sha256=tokenizer_artifact_sha256,
@@ -546,6 +578,7 @@ def verify_patch_run_receipt(
     expected_tokenizer_artifact_sha256: str,
     expected_worker_seed_manifest_sha256: str | None = None,
     expected_sampler_manifest_sha256: str | None = None,
+    expected_dataset_manifest_sha256: str | None = None,
     expected_worker_topology: tuple[int, int, int, int] | None = None,
     now_epoch: int | None = None,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
@@ -573,6 +606,8 @@ def verify_patch_run_receipt(
         or type(receipt.worker_epoch) is not int
         or receipt.worker_epoch < 0
         or type(receipt.sampler_bound) is not bool
+        or type(receipt.dataset_bound) is not bool
+        or (receipt.dataset_bound and not receipt.sampler_bound)
     ):
         raise PatchRunReceiptError("RECEIPT_SCHEMA_INVALID")
     _validate_key_id(receipt.key_id)
@@ -590,6 +625,7 @@ def verify_patch_run_receipt(
         receipt.cuda_rng_after_sha256,
         receipt.worker_seed_manifest_sha256,
         receipt.sampler_manifest_sha256,
+        receipt.dataset_manifest_sha256,
         receipt.sweep_evidence_sha256,
         receipt.signature,
     ):
@@ -641,6 +677,16 @@ def verify_patch_run_receipt(
         if not receipt.sampler_bound or not hmac.compare_digest(
             receipt.sampler_manifest_sha256,
             expected_sampler_digest,
+        ):
+            raise PatchRunReceiptError("RECEIPT_BINDING_MISMATCH")
+    if expected_dataset_manifest_sha256 is not None:
+        expected_dataset_digest = _validate_digest(
+            expected_dataset_manifest_sha256,
+            "DATASET_MANIFEST_DIGEST_INVALID",
+        )
+        if not receipt.dataset_bound or not hmac.compare_digest(
+            receipt.dataset_manifest_sha256,
+            expected_dataset_digest,
         ):
             raise PatchRunReceiptError("RECEIPT_BINDING_MISMATCH")
     if expected_worker_topology is not None:
@@ -700,6 +746,7 @@ def audit_authenticated_cross_seed_dose_response(
     cuda_device_count: int | None = None
     worker_topology: tuple[int, int, int, int] | None = None
     sampler_bound: bool | None = None
+    dataset_identity: tuple[bool, str] | None = None
     for seed in ordered:
         result = runs[seed]
         receipt = receipts[seed]
@@ -738,6 +785,14 @@ def audit_authenticated_cross_seed_dose_response(
             sampler_bound = receipt.sampler_bound
         elif receipt.sampler_bound != sampler_bound:
             raise PatchRunReceiptError("CROSS_SEED_SAMPLER_BOUNDARY_MISMATCH")
+        current_dataset_identity = (
+            receipt.dataset_bound,
+            receipt.dataset_manifest_sha256,
+        )
+        if dataset_identity is None:
+            dataset_identity = current_dataset_identity
+        elif current_dataset_identity != dataset_identity:
+            raise PatchRunReceiptError("CROSS_SEED_DATASET_MISMATCH")
         authenticated_runs.append(AuthenticatedSeedRun(seed=seed, receipt_sha256=_digest(receipt.as_dict())))
 
     if artifact_identity is None:

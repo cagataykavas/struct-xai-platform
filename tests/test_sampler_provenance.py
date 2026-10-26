@@ -5,6 +5,7 @@ import pickle
 import pytest
 from torch.utils.data import DataLoader
 
+from structxai.dataset_manifest import DatasetExample, build_dataset_manifest
 from structxai.sampler_provenance import (
     MAX_DATASET_SIZE,
     SamplerPlanError,
@@ -85,6 +86,45 @@ def test_manifest_does_not_publish_raw_sample_order() -> None:
     assert "indices" not in repr(plan.manifest.as_dict())
     assert plan.manifest.rank_orders[0].sample_count == 50
     assert len(plan.manifest.rank_orders[0].order_sha256) == 64
+
+
+def test_content_manifest_changes_sampler_evidence_without_changing_order() -> None:
+    first_dataset = build_dataset_manifest([DatasetExample("a", b"first"), DatasetExample("b", b"second")])
+    second_dataset = build_dataset_manifest([DatasetExample("a", b"changed"), DatasetExample("b", b"second")])
+
+    first = build_distributed_sampler_plan(
+        13,
+        world_size=1,
+        rank=0,
+        dataset_size=2,
+        dataset_manifest=first_dataset,
+    )
+    second = build_distributed_sampler_plan(
+        13,
+        world_size=1,
+        rank=0,
+        dataset_size=2,
+        dataset_manifest=second_dataset,
+    )
+
+    assert first.sampler == second.sampler
+    assert first.manifest.dataset_bound is True
+    assert first.manifest.dataset_manifest_sha256 == first_dataset.evidence_sha256
+    assert first.manifest.evidence_sha256 != second.manifest.evidence_sha256
+    assert "first" not in repr(first.manifest.as_dict())
+
+
+def test_sampler_rejects_dataset_manifest_size_mismatch() -> None:
+    dataset = build_dataset_manifest([DatasetExample("a", b"first")])
+
+    with pytest.raises(SamplerPlanError, match="SAMPLER_DATASET_SIZE_MISMATCH"):
+        build_distributed_sampler_plan(
+            13,
+            world_size=1,
+            rank=0,
+            dataset_size=2,
+            dataset_manifest=dataset,
+        )
 
 
 @pytest.mark.parametrize(
