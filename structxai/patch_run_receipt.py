@@ -34,6 +34,13 @@ from structxai.patch_dose_response import (
     audit_cross_seed_dose_response,
     audit_dose_response,
 )
+from structxai.sampler_provenance import (
+    DeterministicRankSampler,
+    DistributedSamplerPlan,
+    SamplerPlanError,
+    build_distributed_sampler_plan,
+    verify_distributed_sampler_plan,
+)
 from structxai.worker_seeding import (
     WorkerSeedError,
     WorkerSeedInitializer,
@@ -42,7 +49,7 @@ from structxai.worker_seeding import (
     verify_worker_seed_plan,
 )
 
-RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v3"
+RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v4"
 AUTHENTICATED_AUDIT_SCHEMA = "struct-xai-authenticated-cross-seed/v1"
 ALGORITHM = "HMAC-SHA256"
 PURPOSE = "activation-patch-run"
@@ -78,6 +85,8 @@ class PatchRunReceipt:
     workers_per_rank: int
     worker_epoch: int
     worker_seed_manifest_sha256: str
+    sampler_bound: bool
+    sampler_manifest_sha256: str
     python_rng_before_sha256: str
     numpy_rng_before_sha256: str
     torch_rng_before_sha256: str
@@ -306,6 +315,7 @@ class PatchRunSigner:
         model_artifact_sha256: str,
         tokenizer_artifact_sha256: str,
         _worker_seed_plan: WorkerSeedPlan | None = None,
+        _sampler_plan: DistributedSamplerPlan | None = None,
     ) -> tuple[PatchSweepResult, PatchRunReceipt]:
         active_seed = _validate_seed(seed)
         model_digest = _validate_digest(model_artifact_sha256, "MODEL_ARTIFACT_DIGEST_INVALID")
@@ -331,6 +341,19 @@ class PatchRunSigner:
             workers_per_rank = _worker_seed_plan.manifest.workers_per_rank
             worker_epoch = _worker_seed_plan.manifest.epoch
             worker_seed_manifest_sha256 = _worker_seed_plan.manifest.evidence_sha256
+        if _sampler_plan is None:
+            sampler_bound = False
+            sampler_manifest_sha256 = _digest(
+                {
+                    "schema_version": "struct-xai-distributed-sampler/none",
+                    "root_seed": active_seed,
+                }
+            )
+        else:
+            if not verify_distributed_sampler_plan(_sampler_plan, active_seed):
+                raise PatchRunReceiptError("SAMPLER_PLAN_INVALID")
+            sampler_bound = True
+            sampler_manifest_sha256 = _sampler_plan.manifest.evidence_sha256
 
         if not _RNG_LOCK.acquire(timeout=self._rng_lock_timeout_seconds):
             raise PatchRunReceiptError("RNG_BOUNDARY_BUSY")
@@ -351,6 +374,11 @@ class PatchRunSigner:
                 cuda_before = _cuda_rng_digest(_capture_cuda_rng()[1], cuda_device_count)
                 result = callback()
                 audit_dose_response(result)
+                if _sampler_plan is not None and not verify_distributed_sampler_plan(
+                    _sampler_plan,
+                    active_seed,
+                ):
+                    raise PatchRunReceiptError("SAMPLER_PLAN_CHANGED_DURING_RUN")
                 python_after = _python_rng_digest(random.getstate())
                 numpy_after = _numpy_rng_digest(np.random.get_state())
                 torch_after = _torch_rng_digest(torch.get_rng_state())
@@ -386,6 +414,8 @@ class PatchRunSigner:
             "workers_per_rank": workers_per_rank,
             "worker_epoch": worker_epoch,
             "worker_seed_manifest_sha256": worker_seed_manifest_sha256,
+            "sampler_bound": sampler_bound,
+            "sampler_manifest_sha256": sampler_manifest_sha256,
             "python_rng_before_sha256": python_before,
             "numpy_rng_before_sha256": numpy_before,
             "torch_rng_before_sha256": torch_before,
@@ -433,6 +463,53 @@ class PatchRunSigner:
             _worker_seed_plan=plan,
         )
 
+    def run_with_input_plan(
+        self,
+        callback: Callable[[WorkerSeedInitializer, DeterministicRankSampler], PatchSweepResult],
+        *,
+        seed: int,
+        model_artifact_sha256: str,
+        tokenizer_artifact_sha256: str,
+        world_size: int,
+        rank: int,
+        workers_per_rank: int,
+        dataset_size: int,
+        epoch: int = 0,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ) -> tuple[PatchSweepResult, PatchRunReceipt]:
+        """Supply authenticated worker seeds and an immutable distributed sample order."""
+
+        if not callable(callback):
+            raise PatchRunReceiptError("RUN_CALLBACK_INVALID")
+        try:
+            worker_plan = build_worker_seed_plan(
+                seed,
+                world_size=world_size,
+                rank=rank,
+                workers_per_rank=workers_per_rank,
+                epoch=epoch,
+            )
+            sampler_plan = build_distributed_sampler_plan(
+                seed,
+                world_size=world_size,
+                rank=rank,
+                dataset_size=dataset_size,
+                epoch=epoch,
+                shuffle=shuffle,
+                drop_last=drop_last,
+            )
+        except (WorkerSeedError, SamplerPlanError) as exc:
+            raise PatchRunReceiptError(str(exc)) from exc
+        return self.run(
+            lambda: callback(worker_plan.initializer, sampler_plan.sampler),
+            seed=seed,
+            model_artifact_sha256=model_artifact_sha256,
+            tokenizer_artifact_sha256=tokenizer_artifact_sha256,
+            _worker_seed_plan=worker_plan,
+            _sampler_plan=sampler_plan,
+        )
+
     def run_from_artifacts(
         self,
         callback: Callable[[], PatchSweepResult],
@@ -468,6 +545,7 @@ def verify_patch_run_receipt(
     expected_model_artifact_sha256: str,
     expected_tokenizer_artifact_sha256: str,
     expected_worker_seed_manifest_sha256: str | None = None,
+    expected_sampler_manifest_sha256: str | None = None,
     expected_worker_topology: tuple[int, int, int, int] | None = None,
     now_epoch: int | None = None,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
@@ -494,6 +572,7 @@ def verify_patch_run_receipt(
         or receipt.workers_per_rank < 0
         or type(receipt.worker_epoch) is not int
         or receipt.worker_epoch < 0
+        or type(receipt.sampler_bound) is not bool
     ):
         raise PatchRunReceiptError("RECEIPT_SCHEMA_INVALID")
     _validate_key_id(receipt.key_id)
@@ -510,6 +589,7 @@ def verify_patch_run_receipt(
         receipt.torch_rng_after_sha256,
         receipt.cuda_rng_after_sha256,
         receipt.worker_seed_manifest_sha256,
+        receipt.sampler_manifest_sha256,
         receipt.sweep_evidence_sha256,
         receipt.signature,
     ):
@@ -553,6 +633,16 @@ def verify_patch_run_receipt(
         ),
     ):
         raise PatchRunReceiptError("RECEIPT_BINDING_MISMATCH")
+    if expected_sampler_manifest_sha256 is not None:
+        expected_sampler_digest = _validate_digest(
+            expected_sampler_manifest_sha256,
+            "SAMPLER_MANIFEST_DIGEST_INVALID",
+        )
+        if not receipt.sampler_bound or not hmac.compare_digest(
+            receipt.sampler_manifest_sha256,
+            expected_sampler_digest,
+        ):
+            raise PatchRunReceiptError("RECEIPT_BINDING_MISMATCH")
     if expected_worker_topology is not None:
         if (
             not isinstance(expected_worker_topology, tuple)
@@ -609,6 +699,7 @@ def audit_authenticated_cross_seed_dose_response(
     artifact_identity: tuple[str, str] | None = None
     cuda_device_count: int | None = None
     worker_topology: tuple[int, int, int, int] | None = None
+    sampler_bound: bool | None = None
     for seed in ordered:
         result = runs[seed]
         receipt = receipts[seed]
@@ -643,6 +734,10 @@ def audit_authenticated_cross_seed_dose_response(
             worker_topology = current_worker_topology
         elif current_worker_topology != worker_topology:
             raise PatchRunReceiptError("CROSS_SEED_WORKER_TOPOLOGY_MISMATCH")
+        if sampler_bound is None:
+            sampler_bound = receipt.sampler_bound
+        elif receipt.sampler_bound != sampler_bound:
+            raise PatchRunReceiptError("CROSS_SEED_SAMPLER_BOUNDARY_MISMATCH")
         authenticated_runs.append(AuthenticatedSeedRun(seed=seed, receipt_sha256=_digest(receipt.as_dict())))
 
     if artifact_identity is None:

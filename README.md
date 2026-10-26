@@ -182,12 +182,15 @@ matching seed runs and rejects unstable qualification rates, effect signs, endpo
 For promotion workflows, `PatchRunSigner` now executes each sweep inside a process-serialized
 Python, NumPy, CPU Torch, and capability-aware CUDA seed boundary. It restores every caller RNG
 state in `finally`, fails closed on lock contention or CUDA topology drift, and emits a fresh
-HMAC-SHA256 receipt. Receipt schema v3 binds the declared seed, CUDA device count, pre/post
+HMAC-SHA256 receipt. Receipt schema v4 binds the declared seed, CUDA device count, pre/post
 RNG-state digests, exact sweep evidence, immutable model/tokenizer artifact digests, issue time,
-run identity, signing-key ID, and optional distributed-worker seed topology. The
+run identity, signing-key ID, optional distributed-worker seed topology, and optional
+distributed sample-order manifest. The
 `run_with_worker_plan` path supplies a picklable DataLoader initializer for Python,
 NumPy, and CPU Torch in every local worker while committing all rank/worker seeds as
-privacy-reduced hashes. An authenticated cross-seed wrapper verifies every receipt and
+privacy-reduced hashes. `run_with_input_plan` additionally supplies an immutable
+rank-local sampler and commits every rank's epoch-specific order without publishing
+raw sample indices; mutation during the callback fails closed. An authenticated cross-seed wrapper verifies every receipt and
 rejects mixed CUDA or worker topologies before binding the runs to the aggregate audit. See
 [`docs/distributed-worker-seeding.md`](docs/distributed-worker-seeding.md) for the
 DataLoader contract and persistent-worker limitation. The strict
@@ -269,6 +272,7 @@ structxai/
   patch_dose_response.py bounded layer/dose sweeps, per-run and cross-seed audits
   patch_run_receipt.py seeded execution boundary and authenticated run provenance
   worker_seeding.py  distributed DataLoader seed plans and topology manifests
+  sampler_provenance.py privacy-reduced distributed sample-order manifests
   artifact_manifest.py bounded model/tokenizer file manifests
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
@@ -295,6 +299,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - activation-patch isolation, dose-response and cross-seed stability policy checks;
 - bounded model/tokenizer manifests and in-run mutation rejection;
 - deterministic distributed-worker seed plans and authenticated topology binding;
+- deterministic distributed-sampler orders, mutation checks, and receipt binding;
 - HTML report generation;
 - experiment metadata lifecycle;
 - CLI/package imports;
@@ -311,6 +316,7 @@ The repository tries to make its limitations visible:
 - deletion/replacement effects can be confounded by distribution shift;
 - activation patching targets one token position per run; dose sweeps evaluate a bounded layer set;
 - cross-run stability measures repeatability, not truth;
+- sampler manifests bind integer positions, not the identity or correctness of dataset contents;
 - a visually clean heatmap is not treated as evidence without an explicit metric and experiment identity.
 
 ## Research directions

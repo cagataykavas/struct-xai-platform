@@ -34,13 +34,51 @@ Each worker initializes Python, NumPy's legacy global generator, and CPU Torch.
 The full world topology is capped at 4,096 workers. Seed derivation is domain
 separated, and the builder rejects any derived collision before the run starts.
 
+## Distributed sample-order provenance
+
+`run_with_input_plan` additionally supplies an immutable rank-local sampler. Its
+global manifest commits every rank's exact order without publishing raw sample
+indices:
+
+```python
+result, receipt = signer.run_with_input_plan(
+    lambda worker_init_fn, sampler: run_patch_sweep(
+        DataLoader(
+            dataset,
+            sampler=sampler,
+            shuffle=False,
+            num_workers=4,
+            worker_init_fn=worker_init_fn,
+            persistent_workers=False,
+        )
+    ),
+    seed=42,
+    model_artifact_sha256=model_digest,
+    tokenizer_artifact_sha256=tokenizer_digest,
+    world_size=2,
+    rank=0,
+    workers_per_rank=4,
+    dataset_size=len(dataset),
+    epoch=3,
+    shuffle=True,
+    drop_last=False,
+)
+```
+
+The plan uses a domain-separated permutation seed, deterministic rank striding,
+and explicit padding or truncation. It records dataset size, epoch, shuffle and
+drop-last policy, per-rank counts, and per-rank order digests. Plans are capped at
+one million samples and 1,024 ranks. The signer rebuilds the plan both before and
+after the callback, so in-run sampler mutation prevents receipt issuance.
+
 ## Receipt contract
 
-Receipt schema v3 binds:
+Receipt schema v4 binds:
 
 - world size and local rank;
 - workers per rank and epoch;
 - a canonical SHA-256 manifest covering every rank/worker seed commitment;
+- an optional canonical distributed-sampler manifest covering every rank's order;
 - the existing root seed, model/tokenizer artifacts, backend RNG state, and sweep
   evidence.
 
@@ -54,8 +92,10 @@ can require both the exact manifest digest and expected topology.
 This proves that Struct-XAI derived and supplied a deterministic initializer; it
 cannot prove that arbitrary callback code attached it to every DataLoader. It does
 not seed independent NumPy `Generator` instances, remote services, custom native
-extensions, or a distributed sampler. DataLoader shuffling and
-`DistributedSampler.set_epoch()` remain explicit caller responsibilities.
+extensions, or native-library RNGs. The governed input-plan path supplies both the
+initializer and sampler, but arbitrary callback code can still ignore them. Dataset
+contents are not authenticated: the manifest proves the order of integer positions
+for a declared dataset size, not what samples occupied those positions.
 
 With `persistent_workers=True`, PyTorch does not recreate workers each epoch. Use a
 new loader per governed epoch or an explicit worker reseeding protocol; changing the

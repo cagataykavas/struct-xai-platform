@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 import structxai.patch_run_receipt as receipt_module
 from structxai.patch_dose_response import PatchSweepPoint, PatchSweepResult
@@ -15,6 +16,7 @@ from structxai.patch_run_receipt import (
     audit_authenticated_cross_seed_dose_response,
     verify_patch_run_receipt,
 )
+from structxai.sampler_provenance import build_distributed_sampler_plan
 from structxai.worker_seeding import build_worker_seed_plan
 
 KEY = b"k" * 32
@@ -64,11 +66,7 @@ def signer(run_id: str = "1" * 32) -> PatchRunSigner:
 
 
 def numpy_states_equal(left: tuple, right: tuple) -> bool:
-    return (
-        left[0] == right[0]
-        and np.array_equal(left[1], right[1])
-        and left[2:] == right[2:]
-    )
+    return left[0] == right[0] and np.array_equal(left[1], right[1]) and left[2:] == right[2:]
 
 
 def signed_run(seed: int, result: PatchSweepResult | None = None, **kwargs):
@@ -173,8 +171,7 @@ def test_cuda_rng_state_is_seeded_hashed_and_restored_without_cuda_hardware(
 
     def seed_all(seed: int) -> None:
         active_states[:] = [
-            torch.tensor([(seed + device) % 256, 10, 20], dtype=torch.uint8)
-            for device in range(2)
+            torch.tensor([(seed + device) % 256, 10, 20], dtype=torch.uint8) for device in range(2)
         ]
 
     def restore_all(states: list[torch.Tensor]) -> None:
@@ -415,9 +412,7 @@ def test_authenticated_cross_seed_audit_rejects_mixed_cuda_topology(
     monkeypatch.setattr(
         torch.cuda,
         "manual_seed_all",
-        lambda seed: active_state.__setitem__(
-            0, torch.tensor([seed % 256, 4, 5], dtype=torch.uint8)
-        ),
+        lambda seed: active_state.__setitem__(0, torch.tensor([seed % 256, 4, 5], dtype=torch.uint8)),
     )
     monkeypatch.setattr(
         torch.cuda,
@@ -479,6 +474,121 @@ def test_worker_plan_is_applied_and_authenticated() -> None:
     )
 
 
+def test_input_plan_drives_dataloader_and_is_authenticated() -> None:
+    observed: list[int] = []
+
+    def callback(_initializer, sampler) -> PatchSweepResult:
+        loader = DataLoader(
+            list(range(9)),
+            batch_size=2,
+            sampler=sampler,
+            num_workers=0,
+        )
+        observed.extend(int(value) for batch in loader for value in batch)
+        return sweep()
+
+    result, receipt = signer().run_with_input_plan(
+        callback,
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=2,
+        rank=1,
+        workers_per_rank=2,
+        dataset_size=9,
+        epoch=3,
+    )
+    plan = build_distributed_sampler_plan(
+        42,
+        world_size=2,
+        rank=1,
+        dataset_size=9,
+        epoch=3,
+    )
+
+    assert observed == list(plan.sampler.indices)
+    assert receipt.sampler_bound is True
+    assert receipt.sampler_manifest_sha256 == plan.manifest.evidence_sha256
+    assert "indices" not in repr(receipt)
+    verify_patch_run_receipt(
+        receipt,
+        {"primary": KEY},
+        expected_seed=42,
+        expected_sweep_evidence_sha256=result.evidence_sha256,
+        expected_model_artifact_sha256=MODEL_DIGEST,
+        expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        expected_sampler_manifest_sha256=plan.manifest.evidence_sha256,
+        now_epoch=NOW,
+    )
+
+
+def test_input_plan_mutation_during_callback_fails_closed() -> None:
+    def mutate(_initializer, sampler) -> PatchSweepResult:
+        object.__setattr__(sampler, "indices", tuple(reversed(sampler.indices)))
+        return sweep()
+
+    with pytest.raises(
+        PatchRunReceiptError,
+        match="SAMPLER_PLAN_CHANGED_DURING_RUN",
+    ):
+        signer().run_with_input_plan(
+            mutate,
+            seed=42,
+            model_artifact_sha256=MODEL_DIGEST,
+            tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            world_size=2,
+            rank=0,
+            workers_per_rank=2,
+            dataset_size=8,
+            epoch=1,
+        )
+
+
+def test_sampler_manifest_tampering_breaks_signature() -> None:
+    _, receipt = signer().run_with_input_plan(
+        lambda _initializer, _sampler: sweep(),
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+        dataset_size=8,
+    )
+
+    with pytest.raises(PatchRunReceiptError, match="RECEIPT_SIGNATURE_INVALID"):
+        verify_patch_run_receipt(
+            replace(receipt, sampler_manifest_sha256="9" * 64),
+            {"primary": KEY},
+            expected_seed=42,
+            expected_sweep_evidence_sha256=receipt.sweep_evidence_sha256,
+            expected_model_artifact_sha256=MODEL_DIGEST,
+            expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            now_epoch=NOW,
+        )
+
+
+def test_unbound_run_cannot_satisfy_expected_sampler_manifest() -> None:
+    result, receipt = signer().run(
+        sweep,
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+    )
+
+    with pytest.raises(PatchRunReceiptError, match="RECEIPT_BINDING_MISMATCH"):
+        verify_patch_run_receipt(
+            receipt,
+            {"primary": KEY},
+            expected_seed=42,
+            expected_sweep_evidence_sha256=result.evidence_sha256,
+            expected_model_artifact_sha256=MODEL_DIGEST,
+            expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            expected_sampler_manifest_sha256=receipt.sampler_manifest_sha256,
+            now_epoch=NOW,
+        )
+
+
 def test_worker_manifest_tampering_breaks_signature() -> None:
     _, receipt = signer().run_with_worker_plan(
         lambda _initializer: sweep(),
@@ -530,6 +640,40 @@ def test_authenticated_cross_seed_audit_rejects_mixed_worker_topology() -> None:
         audit_authenticated_cross_seed_dose_response(
             runs,
             {11: first, 22: second},
+            {"primary": KEY},
+            now_epoch=NOW,
+        )
+
+
+def test_authenticated_cross_seed_audit_rejects_mixed_sampler_boundary() -> None:
+    runs = {11: sweep(0.70), 22: sweep(0.72)}
+    _, worker_only = signer("1" * 32).run_with_worker_plan(
+        lambda _initializer: runs[11],
+        seed=11,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+    )
+    _, input_bound = signer("2" * 32).run_with_input_plan(
+        lambda _initializer, _sampler: runs[22],
+        seed=22,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+        dataset_size=8,
+    )
+
+    with pytest.raises(
+        PatchRunReceiptError,
+        match="CROSS_SEED_SAMPLER_BOUNDARY_MISMATCH",
+    ):
+        audit_authenticated_cross_seed_dose_response(
+            runs,
+            {11: worker_only, 22: input_bound},
             {"primary": KEY},
             now_epoch=NOW,
         )
