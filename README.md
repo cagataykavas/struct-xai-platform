@@ -182,7 +182,7 @@ matching seed runs and rejects unstable qualification rates, effect signs, endpo
 For promotion workflows, `PatchRunSigner` now executes each sweep inside a process-serialized
 Python, NumPy, CPU Torch, and capability-aware CUDA seed boundary. It restores every caller RNG
 state in `finally`, fails closed on lock contention or CUDA topology drift, and emits a fresh
-HMAC-SHA256 receipt. Receipt schema v5 binds the declared seed, CUDA device count, pre/post
+HMAC-SHA256 receipt. Receipt schema v6 binds the declared seed, CUDA device count, pre/post
 RNG-state digests, exact sweep evidence, immutable model/tokenizer artifact digests, issue time,
 run identity, signing-key ID, optional distributed-worker seed topology, and optional
 distributed sample-order and dataset-content manifests. The
@@ -196,6 +196,9 @@ mutation fails closed before signing. An authenticated cross-seed wrapper verifi
 rejects mixed CUDA, worker, or dataset identities before binding the runs to the aggregate audit. See
 [`docs/distributed-worker-seeding.md`](docs/distributed-worker-seeding.md) for the
 DataLoader contract and persistent-worker limitation. The strict
+`run_with_acknowledged_input_plan` path additionally requires one atomic,
+challenge-bound acknowledgment from every expected local worker before signing and
+returns its privacy-reduced manifest for independent verification. The strict
 `run_from_artifacts` path computes model/tokenizer identities from bounded, content-addressed
 regular-file manifests and rejects mutation across the experiment run.
 
@@ -274,6 +277,7 @@ structxai/
   patch_dose_response.py bounded layer/dose sweeps, per-run and cross-seed audits
   patch_run_receipt.py seeded execution boundary and authenticated run provenance
   worker_seeding.py  distributed DataLoader seed plans and topology manifests
+  worker_acknowledgment.py strict local-worker execution evidence
   sampler_provenance.py privacy-reduced distributed sample-order manifests
   dataset_manifest.py ordered dataset identity and payload commitments
   artifact_manifest.py bounded model/tokenizer file manifests
@@ -302,6 +306,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - activation-patch isolation, dose-response and cross-seed stability policy checks;
 - bounded model/tokenizer manifests and in-run mutation rejection;
 - deterministic distributed-worker seed plans and authenticated topology binding;
+- fail-closed local-worker acknowledgment manifests with cross-process validation;
 - deterministic distributed-sampler orders, mutation checks, and receipt binding;
 - content-addressed dataset manifests and cross-seed dataset identity checks;
 - HTML report generation;

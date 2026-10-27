@@ -523,6 +523,77 @@ def test_input_plan_drives_dataloader_and_is_authenticated() -> None:
     )
 
 
+def test_acknowledged_input_plan_requires_every_worker_and_binds_manifest() -> None:
+    def callback(initializer, _sampler) -> PatchSweepResult:
+        initializer(0)
+        initializer(1)
+        return sweep()
+
+    result, receipt, acknowledgment_manifest = signer().run_with_acknowledged_input_plan(
+        callback,
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=2,
+        dataset_size=8,
+        epoch=3,
+    )
+
+    assert receipt.worker_acknowledgment_bound is True
+    assert receipt.worker_acknowledgment_manifest_sha256 == acknowledgment_manifest.evidence_sha256
+    assert [item.worker_id for item in acknowledgment_manifest.acknowledgments] == [0, 1]
+    verify_patch_run_receipt(
+        receipt,
+        {"primary": KEY},
+        expected_seed=42,
+        expected_sweep_evidence_sha256=result.evidence_sha256,
+        expected_model_artifact_sha256=MODEL_DIGEST,
+        expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        expected_worker_acknowledgment_manifest_sha256=(acknowledgment_manifest.evidence_sha256),
+        now_epoch=NOW,
+    )
+
+
+def test_acknowledged_input_plan_rejects_ignored_initializer() -> None:
+    with pytest.raises(PatchRunReceiptError, match="WORKER_ACK_MISSING"):
+        signer().run_with_acknowledged_input_plan(
+            lambda _initializer, _sampler: sweep(),
+            seed=42,
+            model_artifact_sha256=MODEL_DIGEST,
+            tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            world_size=1,
+            rank=0,
+            workers_per_rank=2,
+            dataset_size=8,
+        )
+
+
+def test_worker_acknowledgment_manifest_tampering_breaks_signature() -> None:
+    _, receipt, _manifest = signer().run_with_acknowledged_input_plan(
+        lambda initializer, _sampler: (initializer(0), sweep())[1],
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+        dataset_size=8,
+    )
+
+    with pytest.raises(PatchRunReceiptError, match="RECEIPT_SIGNATURE_INVALID"):
+        verify_patch_run_receipt(
+            replace(receipt, worker_acknowledgment_manifest_sha256="9" * 64),
+            {"primary": KEY},
+            expected_seed=42,
+            expected_sweep_evidence_sha256=receipt.sweep_evidence_sha256,
+            expected_model_artifact_sha256=MODEL_DIGEST,
+            expected_tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            now_epoch=NOW,
+        )
+
+
 def test_input_plan_binds_exact_dataset_contents_to_signed_receipt() -> None:
     values = [
         DatasetExample("example-1", b"first payload"),
@@ -793,6 +864,41 @@ def test_authenticated_cross_seed_audit_rejects_mixed_sampler_boundary() -> None
         audit_authenticated_cross_seed_dose_response(
             runs,
             {11: worker_only, 22: input_bound},
+            {"primary": KEY},
+            now_epoch=NOW,
+        )
+
+
+def test_authenticated_cross_seed_audit_rejects_mixed_worker_ack_boundary() -> None:
+    runs = {11: sweep(0.70), 22: sweep(0.72)}
+    _, ordinary = signer("1" * 32).run_with_input_plan(
+        lambda _initializer, _sampler: runs[11],
+        seed=11,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+        dataset_size=8,
+    )
+    _, acknowledged, _manifest = signer("2" * 32).run_with_acknowledged_input_plan(
+        lambda initializer, _sampler: (initializer(0), runs[22])[1],
+        seed=22,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=1,
+        rank=0,
+        workers_per_rank=1,
+        dataset_size=8,
+    )
+
+    with pytest.raises(
+        PatchRunReceiptError,
+        match="CROSS_SEED_WORKER_ACK_BOUNDARY_MISMATCH",
+    ):
+        audit_authenticated_cross_seed_dose_response(
+            runs,
+            {11: ordinary, 22: acknowledged},
             {"primary": KEY},
             now_epoch=NOW,
         )

@@ -47,6 +47,13 @@ from structxai.sampler_provenance import (
     build_distributed_sampler_plan,
     verify_distributed_sampler_plan,
 )
+from structxai.worker_acknowledgment import (
+    AcknowledgingWorkerSeedInitializer,
+    WorkerAcknowledgmentError,
+    WorkerAcknowledgmentManifest,
+    WorkerAcknowledgmentSession,
+    verify_worker_acknowledgment_manifest,
+)
 from structxai.worker_seeding import (
     WorkerSeedError,
     WorkerSeedInitializer,
@@ -55,7 +62,7 @@ from structxai.worker_seeding import (
     verify_worker_seed_plan,
 )
 
-RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v5"
+RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v6"
 AUTHENTICATED_AUDIT_SCHEMA = "struct-xai-authenticated-cross-seed/v1"
 ALGORITHM = "HMAC-SHA256"
 PURPOSE = "activation-patch-run"
@@ -91,6 +98,8 @@ class PatchRunReceipt:
     workers_per_rank: int
     worker_epoch: int
     worker_seed_manifest_sha256: str
+    worker_acknowledgment_bound: bool
+    worker_acknowledgment_manifest_sha256: str
     sampler_bound: bool
     sampler_manifest_sha256: str
     dataset_bound: bool
@@ -324,6 +333,7 @@ class PatchRunSigner:
         tokenizer_artifact_sha256: str,
         _worker_seed_plan: WorkerSeedPlan | None = None,
         _sampler_plan: DistributedSamplerPlan | None = None,
+        _worker_acknowledgment_session: WorkerAcknowledgmentSession | None = None,
     ) -> tuple[PatchSweepResult, PatchRunReceipt]:
         active_seed = _validate_seed(seed)
         model_digest = _validate_digest(model_artifact_sha256, "MODEL_ARTIFACT_DIGEST_INVALID")
@@ -349,6 +359,16 @@ class PatchRunSigner:
             workers_per_rank = _worker_seed_plan.manifest.workers_per_rank
             worker_epoch = _worker_seed_plan.manifest.epoch
             worker_seed_manifest_sha256 = _worker_seed_plan.manifest.evidence_sha256
+        if _worker_acknowledgment_session is None:
+            worker_acknowledgment_bound = False
+            worker_acknowledgment_manifest_sha256 = _digest(
+                {
+                    "schema_version": "struct-xai-worker-acknowledgment/none",
+                    "root_seed": active_seed,
+                }
+            )
+        elif _worker_seed_plan is None or not _worker_acknowledgment_session.matches(_worker_seed_plan):
+            raise PatchRunReceiptError("WORKER_ACK_PLAN_MISMATCH")
         if _sampler_plan is None:
             sampler_bound = False
             sampler_manifest_sha256 = _digest(
@@ -395,6 +415,18 @@ class PatchRunSigner:
                     active_seed,
                 ):
                     raise PatchRunReceiptError("SAMPLER_PLAN_CHANGED_DURING_RUN")
+                if _worker_acknowledgment_session is not None:
+                    try:
+                        acknowledgment_manifest = _worker_acknowledgment_session.finalize()
+                    except WorkerAcknowledgmentError as exc:
+                        raise PatchRunReceiptError(str(exc)) from exc
+                    if _worker_seed_plan is None or not verify_worker_acknowledgment_manifest(
+                        acknowledgment_manifest,
+                        _worker_seed_plan,
+                    ):
+                        raise PatchRunReceiptError("WORKER_ACK_MANIFEST_INVALID")
+                    worker_acknowledgment_bound = True
+                    worker_acknowledgment_manifest_sha256 = acknowledgment_manifest.evidence_sha256
                 python_after = _python_rng_digest(random.getstate())
                 numpy_after = _numpy_rng_digest(np.random.get_state())
                 torch_after = _torch_rng_digest(torch.get_rng_state())
@@ -430,6 +462,8 @@ class PatchRunSigner:
             "workers_per_rank": workers_per_rank,
             "worker_epoch": worker_epoch,
             "worker_seed_manifest_sha256": worker_seed_manifest_sha256,
+            "worker_acknowledgment_bound": worker_acknowledgment_bound,
+            "worker_acknowledgment_manifest_sha256": worker_acknowledgment_manifest_sha256,
             "sampler_bound": sampler_bound,
             "sampler_manifest_sha256": sampler_manifest_sha256,
             "dataset_bound": dataset_bound,
@@ -542,6 +576,75 @@ class PatchRunSigner:
             _sampler_plan=sampler_plan,
         )
 
+    def run_with_acknowledged_input_plan(
+        self,
+        callback: Callable[
+            [AcknowledgingWorkerSeedInitializer, DeterministicRankSampler],
+            PatchSweepResult,
+        ],
+        *,
+        seed: int,
+        model_artifact_sha256: str,
+        tokenizer_artifact_sha256: str,
+        world_size: int,
+        rank: int,
+        workers_per_rank: int,
+        dataset_size: int,
+        epoch: int = 0,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        dataset_examples: Sequence[DatasetExample] | None = None,
+    ) -> tuple[PatchSweepResult, PatchRunReceipt, WorkerAcknowledgmentManifest]:
+        """Require every local worker to acknowledge successful seed initialization."""
+
+        if not callable(callback):
+            raise PatchRunReceiptError("RUN_CALLBACK_INVALID")
+        try:
+            dataset_manifest = (
+                build_dataset_manifest(dataset_examples) if dataset_examples is not None else None
+            )
+            worker_plan = build_worker_seed_plan(
+                seed,
+                world_size=world_size,
+                rank=rank,
+                workers_per_rank=workers_per_rank,
+                epoch=epoch,
+            )
+            sampler_plan = build_distributed_sampler_plan(
+                seed,
+                world_size=world_size,
+                rank=rank,
+                dataset_size=dataset_size,
+                epoch=epoch,
+                shuffle=shuffle,
+                drop_last=drop_last,
+                dataset_manifest=dataset_manifest,
+            )
+        except (DatasetManifestError, WorkerSeedError, SamplerPlanError) as exc:
+            raise PatchRunReceiptError(str(exc)) from exc
+
+        with WorkerAcknowledgmentSession(worker_plan) as acknowledgment_session:
+
+            def run_with_acknowledgment_boundary() -> PatchSweepResult:
+                result = callback(acknowledgment_session.initializer, sampler_plan.sampler)
+                if dataset_manifest is not None and (
+                    dataset_examples is None
+                    or not verify_dataset_manifest(dataset_manifest, dataset_examples)
+                ):
+                    raise PatchRunReceiptError("DATASET_CHANGED_DURING_RUN")
+                return result
+
+            result, receipt = self.run(
+                run_with_acknowledgment_boundary,
+                seed=seed,
+                model_artifact_sha256=model_artifact_sha256,
+                tokenizer_artifact_sha256=tokenizer_artifact_sha256,
+                _worker_seed_plan=worker_plan,
+                _sampler_plan=sampler_plan,
+                _worker_acknowledgment_session=acknowledgment_session,
+            )
+            return result, receipt, acknowledgment_session.manifest
+
     def run_from_artifacts(
         self,
         callback: Callable[[], PatchSweepResult],
@@ -577,6 +680,7 @@ def verify_patch_run_receipt(
     expected_model_artifact_sha256: str,
     expected_tokenizer_artifact_sha256: str,
     expected_worker_seed_manifest_sha256: str | None = None,
+    expected_worker_acknowledgment_manifest_sha256: str | None = None,
     expected_sampler_manifest_sha256: str | None = None,
     expected_dataset_manifest_sha256: str | None = None,
     expected_worker_topology: tuple[int, int, int, int] | None = None,
@@ -605,6 +709,8 @@ def verify_patch_run_receipt(
         or receipt.workers_per_rank < 0
         or type(receipt.worker_epoch) is not int
         or receipt.worker_epoch < 0
+        or type(receipt.worker_acknowledgment_bound) is not bool
+        or (receipt.worker_acknowledgment_bound and receipt.workers_per_rank < 1)
         or type(receipt.sampler_bound) is not bool
         or type(receipt.dataset_bound) is not bool
         or (receipt.dataset_bound and not receipt.sampler_bound)
@@ -624,6 +730,7 @@ def verify_patch_run_receipt(
         receipt.torch_rng_after_sha256,
         receipt.cuda_rng_after_sha256,
         receipt.worker_seed_manifest_sha256,
+        receipt.worker_acknowledgment_manifest_sha256,
         receipt.sampler_manifest_sha256,
         receipt.dataset_manifest_sha256,
         receipt.sweep_evidence_sha256,
@@ -669,6 +776,16 @@ def verify_patch_run_receipt(
         ),
     ):
         raise PatchRunReceiptError("RECEIPT_BINDING_MISMATCH")
+    if expected_worker_acknowledgment_manifest_sha256 is not None:
+        expected_acknowledgment_digest = _validate_digest(
+            expected_worker_acknowledgment_manifest_sha256,
+            "WORKER_ACK_MANIFEST_DIGEST_INVALID",
+        )
+        if not receipt.worker_acknowledgment_bound or not hmac.compare_digest(
+            receipt.worker_acknowledgment_manifest_sha256,
+            expected_acknowledgment_digest,
+        ):
+            raise PatchRunReceiptError("RECEIPT_BINDING_MISMATCH")
     if expected_sampler_manifest_sha256 is not None:
         expected_sampler_digest = _validate_digest(
             expected_sampler_manifest_sha256,
@@ -746,6 +863,7 @@ def audit_authenticated_cross_seed_dose_response(
     cuda_device_count: int | None = None
     worker_topology: tuple[int, int, int, int] | None = None
     sampler_bound: bool | None = None
+    worker_acknowledgment_bound: bool | None = None
     dataset_identity: tuple[bool, str] | None = None
     for seed in ordered:
         result = runs[seed]
@@ -781,6 +899,10 @@ def audit_authenticated_cross_seed_dose_response(
             worker_topology = current_worker_topology
         elif current_worker_topology != worker_topology:
             raise PatchRunReceiptError("CROSS_SEED_WORKER_TOPOLOGY_MISMATCH")
+        if worker_acknowledgment_bound is None:
+            worker_acknowledgment_bound = receipt.worker_acknowledgment_bound
+        elif receipt.worker_acknowledgment_bound != worker_acknowledgment_bound:
+            raise PatchRunReceiptError("CROSS_SEED_WORKER_ACK_BOUNDARY_MISMATCH")
         if sampler_bound is None:
             sampler_bound = receipt.sampler_bound
         elif receipt.sampler_bound != sampler_bound:
