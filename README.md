@@ -198,7 +198,9 @@ rejects mixed CUDA, worker, or dataset identities before binding the runs to the
 DataLoader contract and persistent-worker limitation. The strict
 `run_with_acknowledged_input_plan` path additionally requires one atomic,
 challenge-bound acknowledgment from every expected local worker before signing and
-returns its privacy-reduced manifest for independent verification. The strict
+returns its privacy-reduced manifest for independent verification. A coordinator can
+provide complete rank receipt sets to require every declared rank before cross-seed
+promotion; the audit commits each seed's canonical all-rank manifest. The strict
 `run_from_artifacts` path computes model/tokenizer identities from bounded, content-addressed
 regular-file manifests and rejects mutation across the experiment run.
 
@@ -307,6 +309,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - bounded model/tokenizer manifests and in-run mutation rejection;
 - deterministic distributed-worker seed plans and authenticated topology binding;
 - fail-closed local-worker acknowledgment manifests with cross-process validation;
+- coordinator-side all-rank acknowledgment aggregation for promotion gates;
 - deterministic distributed-sampler orders, mutation checks, and receipt binding;
 - content-addressed dataset manifests and cross-seed dataset identity checks;
 - HTML report generation;

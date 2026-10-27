@@ -121,6 +121,32 @@ oversized, non-canonical, or content-mismatched records. The signed manifest con
 only the challenge digest and worker seed commitments; it never publishes raw seeds.
 Temporary files are removed on both success and failure.
 
+## Coordinator aggregation across ranks
+
+Local acknowledgments are necessary but not sufficient for a multi-rank job: a
+coordinator must refuse promotion when even one rank is absent. Collect the signed
+receipt returned by every rank, keyed by its declared rank, and pass the complete set
+into the authenticated cross-seed audit:
+
+```python
+audit = audit_authenticated_cross_seed_dose_response(
+    runs_by_seed,
+    {seed: rank_receipts[seed][0] for seed in runs_by_seed},
+    keyring,
+    rank_receipt_sets=rank_receipts,
+)
+```
+
+For each seed, `aggregate_rank_acknowledgments` requires exactly ranks
+`0..world_size-1`. It verifies every receipt's signature and freshness, requires a
+local-worker acknowledgment manifest, and rejects disagreement in topology, CUDA
+backend count, artifact identity, worker-seed plan, sampler plan, dataset identity,
+or sweep evidence. Its canonical digest commits the ordered rank receipts and their
+acknowledgment digests. Authenticated cross-seed schema v2 commits one such digest per
+seed, and requires the separately supplied coordinator receipt to be rank 0 from the
+same set. This prevents a valid single-rank receipt from standing in for a complete
+distributed run.
+
 ## Receipt contract
 
 Receipt schema v6 binds:
@@ -136,9 +162,10 @@ Receipt schema v6 binds:
 
 The manifest publishes only SHA-256 seed commitments, never raw worker seeds. Every
 rank derives the same global manifest while receiving only its own initializer
-entries. Cross-seed promotion rejects mixed worker topology or dataset identity,
-and online verification can require exact worker, sampler, and dataset manifest
-digests plus expected topology.
+entries. Cross-seed promotion rejects mixed worker topology or dataset identity, and
+online verification can require exact worker, sampler, and dataset manifest digests
+plus expected topology. When rank receipt sets are supplied, promotion also rejects
+missing ranks and inconsistent rank-level policy.
 
 ## Boundaries
 
@@ -152,6 +179,11 @@ proves only that caller-supplied canonical bytes stayed stable; it does not prov
 semantic correctness, provenance, or that callback code consumed those exact
 objects. SHA-256 commitments also hide values but do not anonymize low-entropy IDs or
 payloads against guessing attacks.
+
+Rank aggregation is coordinator-side evidence, not consensus or remote attestation.
+It assumes the keyring's signers are authorized, clocks satisfy the freshness policy,
+and the coordinator receives all receipts over an authenticated transport. It does
+not detect a compromised signer or prove that ranks communicated with each other.
 
 With `persistent_workers=True`, PyTorch does not recreate workers each epoch. Use a
 new loader per governed epoch or an explicit worker reseeding protocol; changing the
