@@ -14,6 +14,7 @@ from structxai.patch_dose_response import PatchSweepPoint, PatchSweepResult
 from structxai.patch_run_receipt import (
     PatchRunReceiptError,
     PatchRunSigner,
+    aggregate_rank_acknowledgments,
     audit_authenticated_cross_seed_dose_response,
     verify_patch_run_receipt,
 )
@@ -78,6 +79,30 @@ def signed_run(seed: int, result: PatchSweepResult | None = None, **kwargs):
         model_artifact_sha256=kwargs.get("model_digest", MODEL_DIGEST),
         tokenizer_artifact_sha256=kwargs.get("tokenizer_digest", TOKENIZER_DIGEST),
     )
+
+
+def acknowledged_rank_receipts(
+    seed: int,
+    result: PatchSweepResult,
+    *,
+    world_size: int = 2,
+):
+    receipts = {}
+    for rank in range(world_size):
+        run_id = f"{seed:016x}{rank:016x}"
+        _, receipt, _manifest = signer(run_id).run_with_acknowledged_input_plan(
+            lambda initializer, _sampler, active=result: (initializer(0), active)[1],
+            seed=seed,
+            model_artifact_sha256=MODEL_DIGEST,
+            tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+            world_size=world_size,
+            rank=rank,
+            workers_per_rank=1,
+            dataset_size=8,
+            epoch=3,
+        )
+        receipts[rank] = receipt
+    return receipts
 
 
 def test_seeded_boundary_authenticates_run_and_restores_caller_rng_state() -> None:
@@ -375,7 +400,108 @@ def test_authenticated_cross_seed_audit_binds_receipts_and_artifacts() -> None:
     assert audit.model_artifact_sha256 == MODEL_DIGEST
     assert audit.tokenizer_artifact_sha256 == TOKENIZER_DIGEST
     assert [run.seed for run in audit.seed_runs] == [11, 22, 33]
+    assert audit.rank_acknowledgment_bound is False
+    assert audit.seed_rank_manifests == ()
     assert audit.as_dict() == reordered.as_dict()
+
+
+def test_rank_acknowledgment_manifest_requires_and_binds_every_rank() -> None:
+    result = sweep()
+    receipts = acknowledged_rank_receipts(42, result)
+
+    manifest = aggregate_rank_acknowledgments(
+        receipts,
+        {"primary": KEY},
+        expected_seed=42,
+        expected_sweep_evidence_sha256=result.evidence_sha256,
+        now_epoch=NOW,
+    )
+    reordered = aggregate_rank_acknowledgments(
+        {1: receipts[1], 0: receipts[0]},
+        {"primary": KEY},
+        expected_seed=42,
+        expected_sweep_evidence_sha256=result.evidence_sha256,
+        now_epoch=NOW,
+    )
+
+    assert manifest.world_size == 2
+    assert [run.rank for run in manifest.rank_runs] == [0, 1]
+    assert all(run.worker_acknowledgment_manifest_sha256 != "0" * 64 for run in manifest.rank_runs)
+    assert manifest.as_dict() == reordered.as_dict()
+
+
+def test_rank_acknowledgment_manifest_rejects_missing_rank() -> None:
+    result = sweep()
+    receipts = acknowledged_rank_receipts(42, result)
+
+    with pytest.raises(PatchRunReceiptError, match="RANK_RECEIPT_SET_INCOMPLETE"):
+        aggregate_rank_acknowledgments(
+            {0: receipts[0]},
+            {"primary": KEY},
+            expected_seed=42,
+            expected_sweep_evidence_sha256=result.evidence_sha256,
+            now_epoch=NOW,
+        )
+
+
+def test_rank_acknowledgment_manifest_rejects_unacknowledged_rank() -> None:
+    result = sweep()
+    receipts = acknowledged_rank_receipts(42, result)
+    _, unacknowledged = signer("9" * 32).run_with_input_plan(
+        lambda _initializer, _sampler: result,
+        seed=42,
+        model_artifact_sha256=MODEL_DIGEST,
+        tokenizer_artifact_sha256=TOKENIZER_DIGEST,
+        world_size=2,
+        rank=1,
+        workers_per_rank=1,
+        dataset_size=8,
+        epoch=3,
+    )
+
+    with pytest.raises(PatchRunReceiptError, match="RECEIPT_BINDING_MISMATCH"):
+        aggregate_rank_acknowledgments(
+            {0: receipts[0], 1: unacknowledged},
+            {"primary": KEY},
+            expected_seed=42,
+            expected_sweep_evidence_sha256=result.evidence_sha256,
+            now_epoch=NOW,
+        )
+
+
+def test_authenticated_cross_seed_audit_binds_complete_rank_manifests() -> None:
+    runs = {11: sweep(0.70), 22: sweep(0.72), 33: sweep(0.68)}
+    rank_receipt_sets = {seed: acknowledged_rank_receipts(seed, result) for seed, result in runs.items()}
+    receipts = {seed: rank_receipts[0] for seed, rank_receipts in rank_receipt_sets.items()}
+
+    audit = audit_authenticated_cross_seed_dose_response(
+        runs,
+        receipts,
+        {"primary": KEY},
+        now_epoch=NOW,
+        rank_receipt_sets=rank_receipt_sets,
+    )
+
+    assert audit.status == "accepted"
+    assert audit.rank_acknowledgment_bound is True
+    assert [item.seed for item in audit.seed_rank_manifests] == [11, 22, 33]
+    assert all(item.rank_manifest_sha256 != "0" * 64 for item in audit.seed_rank_manifests)
+
+
+def test_authenticated_cross_seed_audit_rejects_unbound_coordinator_receipt() -> None:
+    runs = {11: sweep(0.70), 22: sweep(0.72), 33: sweep(0.68)}
+    rank_receipt_sets = {seed: acknowledged_rank_receipts(seed, result) for seed, result in runs.items()}
+    receipts = {seed: rank_receipts[0] for seed, rank_receipts in rank_receipt_sets.items()}
+    receipts[22] = signed_run(22, runs[22])[1]
+
+    with pytest.raises(PatchRunReceiptError, match="COORDINATOR_RECEIPT_MISMATCH"):
+        audit_authenticated_cross_seed_dose_response(
+            runs,
+            receipts,
+            {"primary": KEY},
+            now_epoch=NOW,
+            rank_receipt_sets=rank_receipt_sets,
+        )
 
 
 def test_authenticated_cross_seed_audit_rejects_missing_or_mixed_artifacts() -> None:

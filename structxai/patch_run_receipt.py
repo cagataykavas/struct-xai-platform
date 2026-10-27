@@ -63,7 +63,8 @@ from structxai.worker_seeding import (
 )
 
 RECEIPT_SCHEMA = "struct-xai-patch-run-receipt/v6"
-AUTHENTICATED_AUDIT_SCHEMA = "struct-xai-authenticated-cross-seed/v1"
+AUTHENTICATED_AUDIT_SCHEMA = "struct-xai-authenticated-cross-seed/v2"
+RANK_ACKNOWLEDGMENT_SCHEMA = "struct-xai-rank-acknowledgment/v1"
 ALGORITHM = "HMAC-SHA256"
 PURPOSE = "activation-patch-run"
 MINIMUM_KEY_BYTES = 32
@@ -131,6 +132,61 @@ class AuthenticatedSeedRun:
 
 
 @dataclass(frozen=True)
+class AuthenticatedRankRun:
+    rank: int
+    receipt_sha256: str
+    worker_acknowledgment_manifest_sha256: str
+
+
+@dataclass(frozen=True)
+class RankAcknowledgmentManifest:
+    schema_version: str
+    seed: int
+    world_size: int
+    workers_per_rank: int
+    worker_epoch: int
+    cuda_device_count: int
+    model_artifact_sha256: str
+    tokenizer_artifact_sha256: str
+    worker_seed_manifest_sha256: str
+    sampler_bound: bool
+    sampler_manifest_sha256: str
+    dataset_bound: bool
+    dataset_manifest_sha256: str
+    sweep_evidence_sha256: str
+    rank_runs: tuple[AuthenticatedRankRun, ...]
+    evidence_sha256: str
+
+    def body(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "seed": self.seed,
+            "world_size": self.world_size,
+            "workers_per_rank": self.workers_per_rank,
+            "worker_epoch": self.worker_epoch,
+            "cuda_device_count": self.cuda_device_count,
+            "model_artifact_sha256": self.model_artifact_sha256,
+            "tokenizer_artifact_sha256": self.tokenizer_artifact_sha256,
+            "worker_seed_manifest_sha256": self.worker_seed_manifest_sha256,
+            "sampler_bound": self.sampler_bound,
+            "sampler_manifest_sha256": self.sampler_manifest_sha256,
+            "dataset_bound": self.dataset_bound,
+            "dataset_manifest_sha256": self.dataset_manifest_sha256,
+            "sweep_evidence_sha256": self.sweep_evidence_sha256,
+            "rank_runs": [asdict(run) for run in self.rank_runs],
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return {**self.body(), "evidence_sha256": self.evidence_sha256}
+
+
+@dataclass(frozen=True)
+class AuthenticatedSeedRankManifest:
+    seed: int
+    rank_manifest_sha256: str
+
+
+@dataclass(frozen=True)
 class AuthenticatedCrossSeedAudit:
     schema_version: str
     status: str
@@ -138,6 +194,8 @@ class AuthenticatedCrossSeedAudit:
     model_artifact_sha256: str
     tokenizer_artifact_sha256: str
     seed_runs: tuple[AuthenticatedSeedRun, ...]
+    rank_acknowledgment_bound: bool
+    seed_rank_manifests: tuple[AuthenticatedSeedRankManifest, ...]
     evidence_sha256: str
 
     def body(self) -> dict[str, object]:
@@ -148,6 +206,8 @@ class AuthenticatedCrossSeedAudit:
             "model_artifact_sha256": self.model_artifact_sha256,
             "tokenizer_artifact_sha256": self.tokenizer_artifact_sha256,
             "seed_runs": [asdict(run) for run in self.seed_runs],
+            "rank_acknowledgment_bound": self.rank_acknowledgment_bound,
+            "seed_rank_manifests": [asdict(manifest) for manifest in self.seed_rank_manifests],
         }
 
     def as_dict(self) -> dict[str, object]:
@@ -839,6 +899,165 @@ def verify_patch_run_receipt(
         raise PatchRunReceiptError("RECEIPT_EXPIRED")
 
 
+def aggregate_rank_acknowledgments(
+    receipts: Mapping[int, PatchRunReceipt],
+    keyring: Mapping[str, bytes],
+    *,
+    expected_seed: int,
+    expected_sweep_evidence_sha256: str,
+    now_epoch: int | None = None,
+    max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
+    clock_skew_seconds: int = DEFAULT_CLOCK_SKEW_SECONDS,
+) -> RankAcknowledgmentManifest:
+    """Verify and commit the complete rank set for one distributed run.
+
+    The returned digest is safe for a coordinator to bind into promotion evidence.
+    It proves that every declared rank supplied a fresh signed receipt whose local
+    worker acknowledgment manifest is present and whose shared run inputs agree.
+    """
+
+    if not isinstance(receipts, Mapping) or not receipts:
+        raise PatchRunReceiptError("RANK_RECEIPT_SET_INVALID")
+    active_seed = _validate_seed(expected_seed)
+    expected_sweep_digest = _validate_digest(
+        expected_sweep_evidence_sha256,
+        "SWEEP_EVIDENCE_DIGEST_INVALID",
+    )
+    if any(type(rank) is not int or rank < 0 for rank in receipts):
+        raise PatchRunReceiptError("RANK_RECEIPT_SET_INVALID")
+
+    rank_zero = receipts.get(0)
+    if not isinstance(rank_zero, PatchRunReceipt):
+        raise PatchRunReceiptError("RANK_ZERO_RECEIPT_MISSING")
+    verify_patch_run_receipt(
+        rank_zero,
+        keyring,
+        expected_seed=active_seed,
+        expected_sweep_evidence_sha256=expected_sweep_digest,
+        expected_model_artifact_sha256=rank_zero.model_artifact_sha256,
+        expected_tokenizer_artifact_sha256=rank_zero.tokenizer_artifact_sha256,
+        expected_worker_seed_manifest_sha256=rank_zero.worker_seed_manifest_sha256,
+        expected_worker_acknowledgment_manifest_sha256=(rank_zero.worker_acknowledgment_manifest_sha256),
+        expected_sampler_manifest_sha256=rank_zero.sampler_manifest_sha256,
+        expected_dataset_manifest_sha256=(
+            rank_zero.dataset_manifest_sha256 if rank_zero.dataset_bound else None
+        ),
+        expected_worker_topology=(
+            rank_zero.worker_world_size,
+            0,
+            rank_zero.workers_per_rank,
+            rank_zero.worker_epoch,
+        ),
+        now_epoch=now_epoch,
+        max_age_seconds=max_age_seconds,
+        clock_skew_seconds=clock_skew_seconds,
+    )
+    world_size = rank_zero.worker_world_size
+    expected_ranks = set(range(world_size))
+    if set(receipts) != expected_ranks:
+        raise PatchRunReceiptError("RANK_RECEIPT_SET_INCOMPLETE")
+
+    shared_identity = (
+        rank_zero.workers_per_rank,
+        rank_zero.worker_epoch,
+        rank_zero.cuda_device_count,
+        rank_zero.model_artifact_sha256,
+        rank_zero.tokenizer_artifact_sha256,
+        rank_zero.worker_seed_manifest_sha256,
+        rank_zero.sampler_bound,
+        rank_zero.sampler_manifest_sha256,
+        rank_zero.dataset_bound,
+        rank_zero.dataset_manifest_sha256,
+        rank_zero.sweep_evidence_sha256,
+    )
+    authenticated_ranks: list[AuthenticatedRankRun] = []
+    for rank in range(world_size):
+        receipt = receipts[rank]
+        if not isinstance(receipt, PatchRunReceipt) or receipt.worker_rank != rank:
+            raise PatchRunReceiptError("RANK_RECEIPT_POSITION_MISMATCH")
+        verify_patch_run_receipt(
+            receipt,
+            keyring,
+            expected_seed=active_seed,
+            expected_sweep_evidence_sha256=expected_sweep_digest,
+            expected_model_artifact_sha256=rank_zero.model_artifact_sha256,
+            expected_tokenizer_artifact_sha256=rank_zero.tokenizer_artifact_sha256,
+            expected_worker_seed_manifest_sha256=rank_zero.worker_seed_manifest_sha256,
+            expected_worker_acknowledgment_manifest_sha256=(receipt.worker_acknowledgment_manifest_sha256),
+            expected_sampler_manifest_sha256=rank_zero.sampler_manifest_sha256,
+            expected_dataset_manifest_sha256=(
+                rank_zero.dataset_manifest_sha256 if rank_zero.dataset_bound else None
+            ),
+            expected_worker_topology=(
+                world_size,
+                rank,
+                rank_zero.workers_per_rank,
+                rank_zero.worker_epoch,
+            ),
+            now_epoch=now_epoch,
+            max_age_seconds=max_age_seconds,
+            clock_skew_seconds=clock_skew_seconds,
+        )
+        current_identity = (
+            receipt.workers_per_rank,
+            receipt.worker_epoch,
+            receipt.cuda_device_count,
+            receipt.model_artifact_sha256,
+            receipt.tokenizer_artifact_sha256,
+            receipt.worker_seed_manifest_sha256,
+            receipt.sampler_bound,
+            receipt.sampler_manifest_sha256,
+            receipt.dataset_bound,
+            receipt.dataset_manifest_sha256,
+            receipt.sweep_evidence_sha256,
+        )
+        if current_identity != shared_identity:
+            raise PatchRunReceiptError("RANK_RECEIPT_IDENTITY_MISMATCH")
+        authenticated_ranks.append(
+            AuthenticatedRankRun(
+                rank=rank,
+                receipt_sha256=_digest(receipt.as_dict()),
+                worker_acknowledgment_manifest_sha256=(receipt.worker_acknowledgment_manifest_sha256),
+            )
+        )
+
+    body = {
+        "schema_version": RANK_ACKNOWLEDGMENT_SCHEMA,
+        "seed": active_seed,
+        "world_size": world_size,
+        "workers_per_rank": rank_zero.workers_per_rank,
+        "worker_epoch": rank_zero.worker_epoch,
+        "cuda_device_count": rank_zero.cuda_device_count,
+        "model_artifact_sha256": rank_zero.model_artifact_sha256,
+        "tokenizer_artifact_sha256": rank_zero.tokenizer_artifact_sha256,
+        "worker_seed_manifest_sha256": rank_zero.worker_seed_manifest_sha256,
+        "sampler_bound": rank_zero.sampler_bound,
+        "sampler_manifest_sha256": rank_zero.sampler_manifest_sha256,
+        "dataset_bound": rank_zero.dataset_bound,
+        "dataset_manifest_sha256": rank_zero.dataset_manifest_sha256,
+        "sweep_evidence_sha256": rank_zero.sweep_evidence_sha256,
+        "rank_runs": [asdict(run) for run in authenticated_ranks],
+    }
+    return RankAcknowledgmentManifest(
+        schema_version=RANK_ACKNOWLEDGMENT_SCHEMA,
+        seed=active_seed,
+        world_size=world_size,
+        workers_per_rank=rank_zero.workers_per_rank,
+        worker_epoch=rank_zero.worker_epoch,
+        cuda_device_count=rank_zero.cuda_device_count,
+        model_artifact_sha256=rank_zero.model_artifact_sha256,
+        tokenizer_artifact_sha256=rank_zero.tokenizer_artifact_sha256,
+        worker_seed_manifest_sha256=rank_zero.worker_seed_manifest_sha256,
+        sampler_bound=rank_zero.sampler_bound,
+        sampler_manifest_sha256=rank_zero.sampler_manifest_sha256,
+        dataset_bound=rank_zero.dataset_bound,
+        dataset_manifest_sha256=rank_zero.dataset_manifest_sha256,
+        sweep_evidence_sha256=rank_zero.sweep_evidence_sha256,
+        rank_runs=tuple(authenticated_ranks),
+        evidence_sha256=_digest(body),
+    )
+
+
 def audit_authenticated_cross_seed_dose_response(
     runs: Mapping[int, PatchSweepResult],
     receipts: Mapping[int, PatchRunReceipt],
@@ -847,6 +1066,7 @@ def audit_authenticated_cross_seed_dose_response(
     now_epoch: int | None = None,
     dose_policy: DoseResponseAuditPolicy | None = None,
     cross_seed_policy: CrossSeedPolicy | None = None,
+    rank_receipt_sets: Mapping[int, Mapping[int, PatchRunReceipt]] | None = None,
 ) -> AuthenticatedCrossSeedAudit:
     """Verify every run receipt and bind them to the cross-seed promotion audit."""
 
@@ -856,6 +1076,11 @@ def audit_authenticated_cross_seed_dose_response(
         raise PatchRunReceiptError("RUN_RECEIPT_SET_MISMATCH")
     if any(isinstance(seed, bool) or not isinstance(seed, int) or seed < 0 for seed in runs):
         raise PatchRunReceiptError("INVALID_SEED")
+    if rank_receipt_sets is not None:
+        if not isinstance(rank_receipt_sets, Mapping):
+            raise PatchRunReceiptError("RANK_RECEIPT_SETS_INVALID")
+        if set(rank_receipt_sets) != set(runs):
+            raise PatchRunReceiptError("RANK_RECEIPT_SEED_SET_MISMATCH")
 
     ordered = tuple(sorted(runs))
     authenticated_runs: list[AuthenticatedSeedRun] = []
@@ -865,9 +1090,16 @@ def audit_authenticated_cross_seed_dose_response(
     sampler_bound: bool | None = None
     worker_acknowledgment_bound: bool | None = None
     dataset_identity: tuple[bool, str] | None = None
+    authenticated_rank_manifests: list[AuthenticatedSeedRankManifest] = []
+    rank_policy: tuple[int, int, int, int, bool, str] | None = None
     for seed in ordered:
         result = runs[seed]
         receipt = receipts[seed]
+        rank_receipts: Mapping[int, PatchRunReceipt] | None = None
+        if rank_receipt_sets is not None:
+            rank_receipts = rank_receipt_sets[seed]
+            if not isinstance(rank_receipts, Mapping) or rank_receipts.get(0) != receipt:
+                raise PatchRunReceiptError("COORDINATOR_RECEIPT_MISMATCH")
         verify_patch_run_receipt(
             receipt,
             keyring,
@@ -916,6 +1148,32 @@ def audit_authenticated_cross_seed_dose_response(
         elif current_dataset_identity != dataset_identity:
             raise PatchRunReceiptError("CROSS_SEED_DATASET_MISMATCH")
         authenticated_runs.append(AuthenticatedSeedRun(seed=seed, receipt_sha256=_digest(receipt.as_dict())))
+        if rank_receipts is not None:
+            rank_manifest = aggregate_rank_acknowledgments(
+                rank_receipts,
+                keyring,
+                expected_seed=seed,
+                expected_sweep_evidence_sha256=result.evidence_sha256,
+                now_epoch=now_epoch,
+            )
+            current_rank_policy = (
+                rank_manifest.world_size,
+                rank_manifest.workers_per_rank,
+                rank_manifest.worker_epoch,
+                rank_manifest.cuda_device_count,
+                rank_manifest.dataset_bound,
+                rank_manifest.dataset_manifest_sha256,
+            )
+            if rank_policy is None:
+                rank_policy = current_rank_policy
+            elif current_rank_policy != rank_policy:
+                raise PatchRunReceiptError("CROSS_SEED_RANK_POLICY_MISMATCH")
+            authenticated_rank_manifests.append(
+                AuthenticatedSeedRankManifest(
+                    seed=seed,
+                    rank_manifest_sha256=rank_manifest.evidence_sha256,
+                )
+            )
 
     if artifact_identity is None:
         raise PatchRunReceiptError("RUN_RECEIPT_SET_MISMATCH")
@@ -931,6 +1189,8 @@ def audit_authenticated_cross_seed_dose_response(
         "model_artifact_sha256": artifact_identity[0],
         "tokenizer_artifact_sha256": artifact_identity[1],
         "seed_runs": [asdict(run) for run in authenticated_runs],
+        "rank_acknowledgment_bound": rank_receipt_sets is not None,
+        "seed_rank_manifests": [asdict(manifest) for manifest in authenticated_rank_manifests],
     }
     return AuthenticatedCrossSeedAudit(
         schema_version=AUTHENTICATED_AUDIT_SCHEMA,
@@ -939,5 +1199,7 @@ def audit_authenticated_cross_seed_dose_response(
         model_artifact_sha256=artifact_identity[0],
         tokenizer_artifact_sha256=artifact_identity[1],
         seed_runs=tuple(authenticated_runs),
+        rank_acknowledgment_bound=rank_receipt_sets is not None,
+        seed_rank_manifests=tuple(authenticated_rank_manifests),
         evidence_sha256=_digest(body),
     )
