@@ -13,6 +13,12 @@ from structxai.interventions import delete_literal, replace_literal
 from structxai.patch_run_receipt import PatchRunReceiptError
 from structxai.patching import patch_final_position, serialize_patch
 from structxai.provenance import validate_artifact
+from structxai.rank_ledger_backup import (
+    create_rank_ledger_backup,
+    load_rank_ledger_backup_manifest,
+    restore_rank_ledger_backup,
+    verify_rank_ledger_backup,
+)
 from structxai.rank_receipt_ingestion import (
     DEFAULT_KEYRING_ENV,
     ingest_rank_receipt_envelope,
@@ -77,6 +83,29 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--ledger", type=Path, required=True)
     ingest.add_argument("--output", type=Path, required=True)
     ingest.add_argument("--keyring-env", default=DEFAULT_KEYRING_ENV)
+
+    backup_ledger = sub.add_parser(
+        "backup-rank-ledger",
+        help="create an online replay-ledger snapshot and integrity manifest",
+    )
+    backup_ledger.add_argument("--ledger", type=Path, required=True)
+    backup_ledger.add_argument("--backup", type=Path, required=True)
+    backup_ledger.add_argument("--manifest", type=Path, required=True)
+
+    verify_ledger = sub.add_parser(
+        "verify-rank-ledger-backup",
+        help="verify a replay-ledger snapshot before standby activation",
+    )
+    verify_ledger.add_argument("--backup", type=Path, required=True)
+    verify_ledger.add_argument("--manifest", type=Path, required=True)
+
+    restore_ledger = sub.add_parser(
+        "restore-rank-ledger-backup",
+        help="verify and restore a replay ledger without overwriting existing state",
+    )
+    restore_ledger.add_argument("--backup", type=Path, required=True)
+    restore_ledger.add_argument("--manifest", type=Path, required=True)
+    restore_ledger.add_argument("--ledger", type=Path, required=True)
     return parser
 
 
@@ -110,6 +139,31 @@ def _write_json_atomic(payload: object, output: Path) -> None:
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    if args.command in {
+        "backup-rank-ledger",
+        "verify-rank-ledger-backup",
+        "restore-rank-ledger-backup",
+    }:
+        try:
+            if args.command == "backup-rank-ledger":
+                result = create_rank_ledger_backup(args.ledger, args.backup, args.manifest)
+            elif args.command == "verify-rank-ledger-backup":
+                result = verify_rank_ledger_backup(
+                    args.backup,
+                    load_rank_ledger_backup_manifest(args.manifest),
+                )
+            else:
+                result = restore_rank_ledger_backup(
+                    args.backup,
+                    load_rank_ledger_backup_manifest(args.manifest),
+                    args.ledger,
+                )
+        except PatchRunReceiptError as exc:
+            print(json.dumps({"error": exc.code}, sort_keys=True), file=sys.stderr)
+            return 2
+        print(json.dumps(result, allow_nan=False, sort_keys=True))
+        return 0
 
     if args.command == "ingest-rank-receipts":
         try:
