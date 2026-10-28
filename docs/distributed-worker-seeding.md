@@ -191,6 +191,56 @@ write was interrupted after the ledger commit. Ledger and output files are mode
 `0600`; duplicate JSON keys, symlink inputs, unknown fields, and envelopes over 8 MiB
 are rejected.
 
+### Backup verification and standby restore
+
+Do not activate a standby coordinator with a raw file copy of a live replay ledger.
+Create an online SQLite snapshot and a separate integrity manifest:
+
+```bash
+struct-xai backup-rank-ledger \
+  --ledger state/rank-receipts.sqlite3 \
+  --backup backups/rank-receipts.sqlite3 \
+  --manifest backups/rank-receipts.manifest.json
+
+struct-xai verify-rank-ledger-backup \
+  --backup backups/rank-receipts.sqlite3 \
+  --manifest backups/rank-receipts.manifest.json
+```
+
+Backup creation uses SQLite's online backup API, so the snapshot is transactionally
+consistent even if the source coordinator remains available. Before publication it
+requires ledger schema version 1, the exact replay tables, `PRAGMA integrity_check`,
+foreign-key consistency, canonical v2 audit JSON, valid SHA-256 fields, and exact
+receipt counts for every promotion. Backup and manifest files are created with mode
+`0600`; symlinks, non-regular files, oversized files, existing output targets, unknown
+manifest fields, and duplicate JSON keys fail closed.
+
+The manifest commits the complete backup bytes and a logical promotion root. Each
+promotion leaf binds a hash of the promotion ID, its envelope and audit digests, its
+receipt count, and the ordered receipt-digest manifest. Raw promotion IDs and audit
+payloads are not copied into the manifest. Verification recomputes both the physical
+and logical commitments.
+
+After verification, restore only into a new standby path:
+
+```bash
+struct-xai restore-rank-ledger-backup \
+  --backup backups/rank-receipts.sqlite3 \
+  --manifest backups/rank-receipts.manifest.json \
+  --ledger standby/rank-receipts.sqlite3
+```
+
+Restore verifies first, copies and fsyncs through a private temporary file, verifies
+the copied SHA-256, and publishes with an exclusive no-overwrite operation. Existing
+standby state is never replaced. An exact promotion retry after restore remains
+idempotent, while cross-promotion receipt replay remains rejected.
+
+SHA-256 detects accidental corruption or changes relative to the supplied manifest;
+it does not authenticate the operator who approved both files. Store or sign the
+manifest in a separate trusted control plane. A verified standby still must not run
+concurrently with the source coordinator for the same namespace: this workflow is
+safe state transfer, not leader election, fencing, or distributed consensus.
+
 ## Receipt contract
 
 Receipt schema v6 binds:

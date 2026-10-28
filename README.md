@@ -201,6 +201,11 @@ challenge-bound acknowledgment from every expected local worker before signing a
 returns its privacy-reduced manifest for independent verification. A coordinator can
 provide complete rank receipt sets to require every declared rank before cross-seed
 promotion; the audit commits each seed's canonical all-rank manifest. The strict
+coordinator ingestion path claims every verified receipt in a restart-safe SQLite
+ledger. Operators can create an online snapshot, verify physical and logical state,
+and restore a new standby ledger without overwriting existing replay state; the
+privacy-reduced manifest commits audit, promotion, and receipt digests without
+publishing promotion IDs or audit payloads. The strict
 `run_from_artifacts` path computes model/tokenizer identities from bounded, content-addressed
 regular-file manifests and rejects mutation across the experiment run.
 
@@ -283,6 +288,8 @@ structxai/
   sampler_provenance.py privacy-reduced distributed sample-order manifests
   dataset_manifest.py ordered dataset identity and payload commitments
   artifact_manifest.py bounded model/tokenizer file manifests
+  rank_receipt_ingestion.py replay-protected all-rank coordinator ingestion
+  rank_ledger_backup.py verified online backup and no-overwrite standby restore
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation
@@ -310,6 +317,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - deterministic distributed-worker seed plans and authenticated topology binding;
 - fail-closed local-worker acknowledgment manifests with cross-process validation;
 - coordinator-side all-rank acknowledgment aggregation for promotion gates;
+- replay-ledger online backup, logical integrity manifests, and standby restore;
 - deterministic distributed-sampler orders, mutation checks, and receipt binding;
 - content-addressed dataset manifests and cross-seed dataset identity checks;
 - HTML report generation;
