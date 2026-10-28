@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
+import tempfile
 from pathlib import Path
 
 from structxai.evaluation import evaluate_interventions
 from structxai.experiment import ExperimentSpec, compare_interventions
 from structxai.interventions import delete_literal, replace_literal
+from structxai.patch_run_receipt import PatchRunReceiptError
 from structxai.patching import patch_final_position, serialize_patch
 from structxai.provenance import validate_artifact
+from structxai.rank_receipt_ingestion import (
+    DEFAULT_KEYRING_ENV,
+    ingest_rank_receipt_envelope,
+    load_ingestion_envelope,
+    load_keyring_from_env,
+)
 from structxai.report import render_report
 from structxai.stability import compare_artifacts
 
@@ -58,6 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report", help="render an experiment JSON artifact as standalone HTML")
     report.add_argument("artifact", type=Path)
     report.add_argument("--output", type=Path)
+
+    ingest = sub.add_parser(
+        "ingest-rank-receipts",
+        help="verify distributed rank receipts and consume them in a replay ledger",
+    )
+    ingest.add_argument("envelope", type=Path)
+    ingest.add_argument("--ledger", type=Path, required=True)
+    ingest.add_argument("--output", type=Path, required=True)
+    ingest.add_argument("--keyring-env", default=DEFAULT_KEYRING_ENV)
     return parser
 
 
@@ -71,8 +90,40 @@ def _write_or_print(payload: object, output: Path | None) -> None:
         print(text)
 
 
+def _write_json_atomic(payload: object, output: Path) -> None:
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+        temporary = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    except OSError as exc:
+        if "temporary" in locals():
+            temporary.unlink(missing_ok=True)
+        raise PatchRunReceiptError("INGESTION_OUTPUT_UNAVAILABLE") from exc
+
+
 def main() -> int:
     args = build_parser().parse_args()
+
+    if args.command == "ingest-rank-receipts":
+        try:
+            result = ingest_rank_receipt_envelope(
+                load_ingestion_envelope(args.envelope),
+                load_keyring_from_env(args.keyring_env),
+                args.ledger,
+            )
+            _write_json_atomic(result, args.output)
+        except PatchRunReceiptError as exc:
+            print(json.dumps({"error": exc.code}, sort_keys=True), file=sys.stderr)
+            return 2
+        print(args.output)
+        return 0
 
     if args.command == "compare":
         interventions = []

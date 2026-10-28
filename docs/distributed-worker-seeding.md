@@ -147,6 +147,50 @@ seed, and requires the separately supplied coordinator receipt to be rank 0 from
 same set. This prevents a valid single-rank receipt from standing in for a complete
 distributed run.
 
+### Replay-protected coordinator ingestion
+
+For a promotion boundary that survives coordinator restarts, place each completed
+`PatchSweepResult.as_dict()` and every rank's `PatchRunReceipt.as_dict()` in a
+versioned envelope:
+
+```json
+{
+  "schema_version": "struct-xai-rank-receipt-ingestion/v1",
+  "promotion_id": "release-2026-10-28",
+  "runs": [
+    {
+      "seed": 11,
+      "sweep_result": {"...": "complete PatchSweepResult"},
+      "rank_receipts": [
+        {"...": "rank 0 PatchRunReceipt"},
+        {"...": "rank 1 PatchRunReceipt"}
+      ]
+    }
+  ]
+}
+```
+
+Supply authorized HMAC keys as base64 values in an environment variable rather
+than command-line arguments, then ingest the envelope into a persistent SQLite
+ledger:
+
+```bash
+export STRUCTXAI_PATCH_RECEIPT_KEYRING_JSON='{"primary":"<base64-key>"}'
+struct-xai ingest-rank-receipts promotion.json \
+  --ledger state/rank-receipts.sqlite3 \
+  --output artifacts/authenticated-audit.json
+```
+
+The command performs the existing signature, freshness, complete-rank, shared-input,
+and cross-seed policy checks before touching replay state. It then claims the
+promotion ID and every receipt digest in one `BEGIN IMMEDIATE` transaction. A receipt
+already claimed by another promotion fails with `RANK_RECEIPT_REPLAYED`; rebinding a
+promotion ID fails with `PROMOTION_ID_REUSED`. An exact retry of the same envelope is
+idempotent and returns the stored v2 audit, allowing recovery if the atomic output
+write was interrupted after the ledger commit. Ledger and output files are mode
+`0600`; duplicate JSON keys, symlink inputs, unknown fields, and envelopes over 8 MiB
+are rejected.
+
 ## Receipt contract
 
 Receipt schema v6 binds:
@@ -184,6 +228,10 @@ Rank aggregation is coordinator-side evidence, not consensus or remote attestati
 It assumes the keyring's signers are authorized, clocks satisfy the freshness policy,
 and the coordinator receives all receipts over an authenticated transport. It does
 not detect a compromised signer or prove that ranks communicated with each other.
+The replay ledger is local coordinator state: operators must place it on durable,
+access-controlled storage and must not copy or independently operate multiple ledger
+files for the same promotion namespace. SQLite transactionality does not provide
+distributed consensus across coordinators.
 
 With `persistent_workers=True`, PyTorch does not recreate workers each epoch. Use a
 new loader per governed epoch or an explicit worker reseeding protocol; changing the
