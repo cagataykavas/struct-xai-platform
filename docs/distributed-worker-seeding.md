@@ -297,6 +297,64 @@ consensus. HMAC authenticates parties that share the controller secret; deployme
 need public verification or signer separation should replace this envelope with an
 external KMS-backed asymmetric signature while preserving the same claims.
 
+### External asymmetric signature adapter
+
+The same module provides a provider-neutral boundary for KMS/HSM-backed asymmetric
+signatures. The application sends canonical claims to a signer callback and receives
+only signature bytes; private key material never enters the handoff library:
+
+```python
+from structxai.rank_ledger_handoff import (
+    create_external_rank_ledger_handoff,
+    restore_external_authorized_rank_ledger,
+)
+
+# The adapter exposes immutable metadata and sign(message: bytes) -> bytes.
+handoff = create_external_rank_ledger_handoff(
+    backup_path,
+    backup_manifest,
+    authority_epoch=43,
+    source_controller_id="controller-primary",
+    standby_id="controller-standby-b",
+    downstream_fence_sha256=fence_ack_sha256,
+    issued_at_epoch=issued_at,
+    expires_at_epoch=issued_at + 300,
+    signer=kms_signer,
+)
+
+# Verifiers are selected by key ID and must expose the exact same algorithm and
+# immutable public-key revision commitment as the signed handoff.
+result = restore_external_authorized_rank_ledger(
+    backup_path,
+    backup_manifest,
+    handoff,
+    {kms_verifier.key_id: kms_verifier},
+    standby_ledger_path,
+    required_authority_epoch=authority_store.current_epoch(),
+    expected_source_controller_id="controller-primary",
+    expected_standby_id="controller-standby-b",
+    expected_downstream_fence_sha256=fence_service.current_ack_sha256(),
+    now_epoch=clock(),
+)
+```
+
+The adapter contract binds a safe algorithm identifier, rotation-friendly key ID and
+SHA-256 commitment to an immutable public-key revision. Use a canonical public-key DER
+digest or a reviewed immutable provider key-version commitment—not a mutable alias. The
+allowed algorithms are `ED25519`, `ECDSA-P256-SHA256`, `RSASSA-PSS-SHA256`, and
+`RSASSA-PKCS1-V1_5-SHA256`; unreviewed or symmetric algorithms fail closed. The signature
+is canonical unpadded base64url and decodes to 32–8192 bytes. Non-byte signer
+responses, malformed encodings, wrong revisions, unknown keys, non-boolean verification
+results, provider exceptions and claim mutations fail closed. Provider exception text is
+not copied into the public error. Verification evidence includes the algorithm, key ID,
+key-revision commitment and exact signature-input digest, never private key material.
+
+The adapter intentionally does not implement a cloud SDK, choose an algorithm, fetch a
+public key, validate a certificate chain or configure provider IAM. Production adapters
+must enforce an asymmetric algorithm, an immutable enabled key version, bounded transport
+deadlines and reviewed sign/verify permissions. The external authority epoch and fence
+must still come from independent rollback-resistant control-plane systems.
+
 ## Receipt contract
 
 Receipt schema v6 binds:

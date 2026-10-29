@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 import json
 import sqlite3
 import stat
@@ -20,11 +22,18 @@ from structxai.rank_ledger_backup import (
 )
 from structxai.rank_ledger_handoff import (
     AUTHORIZED_RESTORE_SCHEMA,
+    EXTERNAL_AUTHORIZED_RESTORE_SCHEMA,
+    EXTERNAL_HANDOFF_SCHEMA,
+    EXTERNAL_HANDOFF_VERIFICATION_SCHEMA,
     HANDOFF_SCHEMA,
     HANDOFF_VERIFICATION_SCHEMA,
+    create_external_rank_ledger_handoff,
     create_rank_ledger_handoff,
+    load_external_rank_ledger_handoff,
     load_rank_ledger_handoff,
     restore_authorized_rank_ledger,
+    restore_external_authorized_rank_ledger,
+    verify_external_rank_ledger_handoff,
     verify_rank_ledger_handoff,
 )
 from structxai.rank_receipt_ingestion import (
@@ -39,6 +48,25 @@ NOW = int(time.time())
 MODEL_DIGEST = "a" * 64
 TOKENIZER_DIGEST = "b" * 64
 SEEDS = (11, 22, 33)
+EXTERNAL_KEY_REVISION = hashlib.sha256(b"contract-test-public-key").hexdigest()
+
+
+class _ContractTestSignatureAdapter:
+    """Deterministic callback adapter for contract tests, not production crypto."""
+
+    algorithm = "RSASSA-PSS-SHA256"
+    key_id = "kms-handoff-primary"
+    key_revision_sha256 = EXTERNAL_KEY_REVISION
+
+    @staticmethod
+    def _signature(message: bytes) -> bytes:
+        return hashlib.sha512(b"contract-test-only\0" + message).digest()
+
+    def sign(self, message: bytes) -> bytes:
+        return self._signature(message)
+
+    def verify(self, message: bytes, signature: bytes) -> bool:
+        return hmac.compare_digest(signature, self._signature(message))
 
 
 def sweep(endpoint: float) -> PatchSweepResult:
@@ -688,3 +716,265 @@ def test_handoff_refuses_a_different_verified_backup(
     assert backup.exists()
     assert manifest["promotion_count"] == 1
     assert newer_manifest["promotion_count"] == 2
+
+
+def _external_handoff_fixture(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> tuple[Path, dict[str, object], dict[str, object]]:
+    backup, manifest, _hmac_handoff = _handoff_fixture(tmp_path, envelope)
+    handoff = create_external_rank_ledger_handoff(
+        backup,
+        manifest,
+        authority_epoch=43,
+        source_controller_id="controller-primary",
+        standby_id="controller-standby-b",
+        downstream_fence_sha256="8" * 64,
+        issued_at_epoch=NOW,
+        expires_at_epoch=NOW + 300,
+        signer=_ContractTestSignatureAdapter(),
+    )
+    return backup, manifest, handoff
+
+
+def _verify_external_handoff(
+    backup: Path,
+    manifest: dict[str, object],
+    handoff: dict[str, object],
+    *,
+    verifier=None,
+) -> dict[str, object]:
+    active_verifier = verifier or _ContractTestSignatureAdapter()
+    return verify_external_rank_ledger_handoff(
+        backup,
+        manifest,
+        handoff,
+        {active_verifier.key_id: active_verifier},
+        required_authority_epoch=43,
+        expected_source_controller_id="controller-primary",
+        expected_standby_id="controller-standby-b",
+        expected_downstream_fence_sha256="8" * 64,
+        now_epoch=NOW + 1,
+    )
+
+
+def test_external_signature_handoff_restores_and_preserves_replay_state(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, handoff = _external_handoff_fixture(tmp_path, envelope)
+    restored = tmp_path / "external-authorized" / "rank-ledger.sqlite3"
+
+    result = restore_external_authorized_rank_ledger(
+        backup,
+        manifest,
+        handoff,
+        {_ContractTestSignatureAdapter.key_id: _ContractTestSignatureAdapter()},
+        restored,
+        required_authority_epoch=43,
+        expected_source_controller_id="controller-primary",
+        expected_standby_id="controller-standby-b",
+        expected_downstream_fence_sha256="8" * 64,
+        now_epoch=NOW + 1,
+    )
+    retry = ingest_rank_receipt_envelope(envelope, {"primary": KEY}, restored, now_epoch=NOW)
+
+    assert handoff["schema_version"] == EXTERNAL_HANDOFF_SCHEMA
+    assert handoff["key_revision_sha256"] == EXTERNAL_KEY_REVISION
+    assert result["schema_version"] == EXTERNAL_AUTHORIZED_RESTORE_SCHEMA
+    assert result["authorized"] is True
+    assert result["restored"] is True
+    assert result["algorithm"] == "RSASSA-PSS-SHA256"
+    assert result["key_revision_sha256"] == EXTERNAL_KEY_REVISION
+    assert len(result["signature_input_sha256"]) == 64
+    assert retry["replayed"] is True
+    assert stat.S_IMODE(restored.stat().st_mode) == 0o600
+
+
+def test_external_signature_verification_is_deterministic_and_content_minimizing(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, handoff = _external_handoff_fixture(tmp_path, envelope)
+
+    first = _verify_external_handoff(backup, manifest, handoff)
+    second = _verify_external_handoff(backup, manifest, handoff)
+
+    assert first == second
+    assert first["schema_version"] == EXTERNAL_HANDOFF_VERIFICATION_SCHEMA
+    assert first["handoff_sha256"]
+    serialized = json.dumps(handoff, sort_keys=True)
+    assert HANDOFF_KEY.hex() not in serialized
+    assert "contract-test-only" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("authority_epoch", 44, "LEDGER_HANDOFF_SIGNATURE_INVALID"),
+        ("standby_id", "controller-standby-c", "LEDGER_HANDOFF_SIGNATURE_INVALID"),
+        (
+            "key_revision_sha256",
+            "7" * 64,
+            "LEDGER_HANDOFF_KEY_REVISION_MISMATCH",
+        ),
+        ("signature", "not+base64", "LEDGER_HANDOFF_EXTERNAL_SIGNATURE_INVALID"),
+        ("signature", "YQ==", "LEDGER_HANDOFF_EXTERNAL_SIGNATURE_INVALID"),
+    ],
+)
+def test_external_handoff_tampering_fails_closed(
+    tmp_path: Path,
+    envelope: dict[str, object],
+    field: str,
+    value: object,
+    error: str,
+) -> None:
+    backup, manifest, handoff = _external_handoff_fixture(tmp_path, envelope)
+    target = tmp_path / "must-not-exist.sqlite3"
+
+    with pytest.raises(PatchRunReceiptError, match=error):
+        restore_external_authorized_rank_ledger(
+            backup,
+            manifest,
+            {**handoff, field: value},
+            {_ContractTestSignatureAdapter.key_id: _ContractTestSignatureAdapter()},
+            target,
+            required_authority_epoch=43,
+            expected_source_controller_id="controller-primary",
+            expected_standby_id="controller-standby-b",
+            expected_downstream_fence_sha256="8" * 64,
+            now_epoch=NOW + 1,
+        )
+
+    assert not target.exists()
+
+
+def test_external_verifier_must_match_exact_key_revision(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, handoff = _external_handoff_fixture(tmp_path, envelope)
+
+    class WrongRevisionVerifier(_ContractTestSignatureAdapter):
+        key_revision_sha256 = "7" * 64
+
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_KEY_REVISION_MISMATCH"):
+        _verify_external_handoff(
+            backup,
+            manifest,
+            handoff,
+            verifier=WrongRevisionVerifier(),
+        )
+
+    class SymmetricVerifier(_ContractTestSignatureAdapter):
+        algorithm = "HMAC-SHA512"
+
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_EXTERNAL_ADAPTER_INVALID"):
+        _verify_external_handoff(
+            backup,
+            manifest,
+            handoff,
+            verifier=SymmetricVerifier(),
+        )
+
+
+def test_external_adapter_rejects_unknown_keys_and_non_boolean_verdicts(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, handoff = _external_handoff_fixture(tmp_path, envelope)
+    arguments = {
+        "required_authority_epoch": 43,
+        "expected_source_controller_id": "controller-primary",
+        "expected_standby_id": "controller-standby-b",
+        "expected_downstream_fence_sha256": "8" * 64,
+        "now_epoch": NOW + 1,
+    }
+
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_KEY_UNKNOWN"):
+        verify_external_rank_ledger_handoff(
+            backup,
+            manifest,
+            handoff,
+            {},
+            **arguments,
+        )
+
+    class NonBooleanVerifier(_ContractTestSignatureAdapter):
+        def verify(self, message: bytes, signature: bytes) -> bool:
+            return 1  # type: ignore[return-value]
+
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_SIGNATURE_INVALID"):
+        verify_external_rank_ledger_handoff(
+            backup,
+            manifest,
+            handoff,
+            {NonBooleanVerifier.key_id: NonBooleanVerifier()},
+            **arguments,
+        )
+
+
+def test_external_adapter_failures_are_normalized(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, _handoff = _handoff_fixture(tmp_path, envelope)
+
+    class FailingSigner(_ContractTestSignatureAdapter):
+        def sign(self, message: bytes) -> bytes:
+            raise RuntimeError(f"provider secret: {message[:4]!r}")
+
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_EXTERNAL_SIGNING_FAILED") as error:
+        create_external_rank_ledger_handoff(
+            backup,
+            manifest,
+            authority_epoch=43,
+            source_controller_id="controller-primary",
+            standby_id="controller-standby-b",
+            downstream_fence_sha256="8" * 64,
+            issued_at_epoch=NOW,
+            expires_at_epoch=NOW + 300,
+            signer=FailingSigner(),
+        )
+    assert "provider secret" not in str(error.value)
+
+    backup, manifest, handoff = _external_handoff_fixture(tmp_path / "verify", envelope)
+
+    class FailingVerifier(_ContractTestSignatureAdapter):
+        def verify(self, message: bytes, signature: bytes) -> bool:
+            raise RuntimeError(f"provider secret: {message[:4]!r} {signature[:4]!r}")
+
+    with pytest.raises(
+        PatchRunReceiptError,
+        match="LEDGER_HANDOFF_EXTERNAL_VERIFICATION_FAILED",
+    ) as error:
+        _verify_external_handoff(
+            backup,
+            manifest,
+            handoff,
+            verifier=FailingVerifier(),
+        )
+    assert "provider secret" not in str(error.value)
+
+
+def test_external_handoff_loader_rejects_duplicates_and_symlinks(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    _backup, _manifest, handoff = _external_handoff_fixture(tmp_path, envelope)
+    path = tmp_path / "external-handoff.json"
+    path.write_text(json.dumps(handoff), encoding="utf-8")
+    assert load_external_rank_ledger_handoff(path) == handoff
+
+    duplicate = tmp_path / "duplicate-external-handoff.json"
+    duplicate.write_text(
+        '{"schema_version":"one","schema_version":"two"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_FILE_INVALID"):
+        load_external_rank_ledger_handoff(duplicate)
+
+    link = tmp_path / "external-handoff-link.json"
+    link.symlink_to(path)
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_FILE_INVALID"):
+        load_external_rank_ledger_handoff(link)
