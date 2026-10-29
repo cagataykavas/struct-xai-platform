@@ -290,6 +290,7 @@ structxai/
   artifact_manifest.py bounded model/tokenizer file manifests
   rank_receipt_ingestion.py replay-protected all-rank coordinator ingestion
   rank_ledger_backup.py verified online backup and no-overwrite standby restore
+  rank_ledger_handoff.py signed epoch/fence authorization for standby restore
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation
@@ -318,6 +319,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - fail-closed local-worker acknowledgment manifests with cross-process validation;
 - coordinator-side all-rank acknowledgment aggregation for promotion gates;
 - replay-ledger online backup, logical integrity manifests, and standby restore;
+- signed, short-lived authority handoffs with external epoch and fence checks;
 - deterministic distributed-sampler orders, mutation checks, and receipt binding;
 - content-addressed dataset manifests and cross-seed dataset identity checks;
 - HTML report generation;
@@ -338,6 +340,7 @@ The repository tries to make its limitations visible:
 - cross-run stability measures repeatability, not truth;
 - dataset manifests authenticate caller-canonicalized bytes, not their semantic correctness or origin;
 - a visually clean heatmap is not treated as evidence without an explicit metric and experiment identity.
+- signed handoffs authenticate state transfer but do not allocate epochs, fence a source, or provide consensus.
 
 ## Research directions
 

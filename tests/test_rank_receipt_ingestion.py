@@ -18,6 +18,15 @@ from structxai.rank_ledger_backup import (
     restore_rank_ledger_backup,
     verify_rank_ledger_backup,
 )
+from structxai.rank_ledger_handoff import (
+    AUTHORIZED_RESTORE_SCHEMA,
+    HANDOFF_SCHEMA,
+    HANDOFF_VERIFICATION_SCHEMA,
+    create_rank_ledger_handoff,
+    load_rank_ledger_handoff,
+    restore_authorized_rank_ledger,
+    verify_rank_ledger_handoff,
+)
 from structxai.rank_receipt_ingestion import (
     INGESTION_SCHEMA,
     ingest_rank_receipt_envelope,
@@ -25,6 +34,7 @@ from structxai.rank_receipt_ingestion import (
 )
 
 KEY = b"k" * 32
+HANDOFF_KEY = b"h" * 32
 NOW = int(time.time())
 MODEL_DIGEST = "a" * 64
 TOKENIZER_DIGEST = "b" * 64
@@ -439,3 +449,242 @@ def test_backup_verify_restore_cli_workflow(
     )
     assert main() == 0
     assert json.loads(capsys.readouterr().out)["restored"] is True
+
+
+def _handoff_fixture(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> tuple[Path, dict[str, object], dict[str, object]]:
+    ledger = _ingested_ledger(tmp_path, envelope)
+    backup = tmp_path / "handoff-backup.sqlite3"
+    manifest = create_rank_ledger_backup(
+        ledger,
+        backup,
+        tmp_path / "handoff-backup.json",
+    )
+    handoff = create_rank_ledger_handoff(
+        backup,
+        manifest,
+        authority_epoch=42,
+        source_controller_id="controller-primary",
+        standby_id="controller-standby-a",
+        downstream_fence_sha256="9" * 64,
+        issued_at_epoch=NOW,
+        expires_at_epoch=NOW + 300,
+        key_id="handoff-primary",
+        key=HANDOFF_KEY,
+    )
+    return backup, manifest, handoff
+
+
+def _verify_handoff(
+    backup: Path,
+    manifest: dict[str, object],
+    handoff: dict[str, object],
+    **overrides,
+) -> dict[str, object]:
+    arguments = {
+        "required_authority_epoch": 42,
+        "expected_source_controller_id": "controller-primary",
+        "expected_standby_id": "controller-standby-a",
+        "expected_downstream_fence_sha256": "9" * 64,
+        "now_epoch": NOW + 1,
+    }
+    arguments.update(overrides)
+    return verify_rank_ledger_handoff(
+        backup,
+        manifest,
+        handoff,
+        {"handoff-primary": HANDOFF_KEY},
+        **arguments,
+    )
+
+
+def test_signed_handoff_authorizes_restore_and_preserves_replay_state(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, handoff = _handoff_fixture(tmp_path, envelope)
+    restored = tmp_path / "authorized" / "rank-ledger.sqlite3"
+
+    result = restore_authorized_rank_ledger(
+        backup,
+        manifest,
+        handoff,
+        {"handoff-primary": HANDOFF_KEY},
+        restored,
+        required_authority_epoch=42,
+        expected_source_controller_id="controller-primary",
+        expected_standby_id="controller-standby-a",
+        expected_downstream_fence_sha256="9" * 64,
+        now_epoch=NOW + 1,
+    )
+    retry = ingest_rank_receipt_envelope(envelope, {"primary": KEY}, restored, now_epoch=NOW)
+
+    assert handoff["schema_version"] == HANDOFF_SCHEMA
+    assert result["schema_version"] == AUTHORIZED_RESTORE_SCHEMA
+    assert result["authorized"] is True
+    assert result["restored"] is True
+    assert result["authority_epoch"] == 42
+    assert result["downstream_fence_sha256"] == "9" * 64
+    assert retry["replayed"] is True
+    assert stat.S_IMODE(restored.stat().st_mode) == 0o600
+
+
+def test_handoff_verification_is_deterministic_and_content_bound(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, handoff = _handoff_fixture(tmp_path, envelope)
+
+    first = _verify_handoff(backup, manifest, handoff)
+    second = _verify_handoff(backup, manifest, handoff)
+
+    assert first == second
+    assert first["schema_version"] == HANDOFF_VERIFICATION_SCHEMA
+    assert first["authorized"] is True
+    assert len(first["handoff_sha256"]) == 64
+    assert first["backup_manifest_sha256"] == manifest["manifest_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("authority_epoch", 43),
+        ("standby_id", "controller-standby-b"),
+        ("downstream_fence_sha256", "8" * 64),
+        ("backup_sha256", "7" * 64),
+    ],
+)
+def test_unsigned_handoff_mutation_is_rejected_before_restore(
+    tmp_path: Path,
+    envelope: dict[str, object],
+    field: str,
+    value: object,
+) -> None:
+    backup, manifest, handoff = _handoff_fixture(tmp_path, envelope)
+    target = tmp_path / "must-not-exist.sqlite3"
+
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_SIGNATURE_INVALID"):
+        restore_authorized_rank_ledger(
+            backup,
+            manifest,
+            {**handoff, field: value},
+            {"handoff-primary": HANDOFF_KEY},
+            target,
+            required_authority_epoch=42,
+            expected_source_controller_id="controller-primary",
+            expected_standby_id="controller-standby-a",
+            expected_downstream_fence_sha256="9" * 64,
+            now_epoch=NOW + 1,
+        )
+
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"required_authority_epoch": 41}, "LEDGER_HANDOFF_EPOCH_MISMATCH"),
+        (
+            {"expected_source_controller_id": "controller-secondary"},
+            "LEDGER_HANDOFF_SOURCE_MISMATCH",
+        ),
+        (
+            {"expected_standby_id": "controller-standby-b"},
+            "LEDGER_HANDOFF_STANDBY_MISMATCH",
+        ),
+        (
+            {"expected_downstream_fence_sha256": "8" * 64},
+            "LEDGER_HANDOFF_FENCE_MISMATCH",
+        ),
+        ({"now_epoch": NOW - 10}, "LEDGER_HANDOFF_NOT_YET_VALID"),
+        ({"now_epoch": NOW + 301}, "LEDGER_HANDOFF_EXPIRED"),
+    ],
+)
+def test_external_authority_constraints_fail_closed(
+    tmp_path: Path,
+    envelope: dict[str, object],
+    overrides: dict[str, object],
+    error: str,
+) -> None:
+    backup, manifest, handoff = _handoff_fixture(tmp_path, envelope)
+
+    with pytest.raises(PatchRunReceiptError, match=error):
+        _verify_handoff(backup, manifest, handoff, **overrides)
+
+
+def test_handoff_key_rotation_rejects_unknown_and_short_keys(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, handoff = _handoff_fixture(tmp_path, envelope)
+    arguments = {
+        "required_authority_epoch": 42,
+        "expected_source_controller_id": "controller-primary",
+        "expected_standby_id": "controller-standby-a",
+        "expected_downstream_fence_sha256": "9" * 64,
+        "now_epoch": NOW + 1,
+    }
+
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_KEY_UNKNOWN"):
+        verify_rank_ledger_handoff(backup, manifest, handoff, {}, **arguments)
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_KEY_INVALID"):
+        verify_rank_ledger_handoff(
+            backup,
+            manifest,
+            handoff,
+            {"handoff-primary": b"short"},
+            **arguments,
+        )
+
+
+def test_handoff_loader_rejects_duplicates_and_symlinks(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, handoff = _handoff_fixture(tmp_path, envelope)
+    assert _verify_handoff(backup, manifest, handoff)["authorized"] is True
+    handoff_path = tmp_path / "handoff.json"
+    handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
+    assert load_rank_ledger_handoff(handoff_path) == handoff
+
+    duplicate = tmp_path / "duplicate-handoff.json"
+    duplicate.write_text(
+        '{"schema_version":"one","schema_version":"two"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_FILE_INVALID"):
+        load_rank_ledger_handoff(duplicate)
+
+    link = tmp_path / "handoff-link.json"
+    link.symlink_to(handoff_path)
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_FILE_INVALID"):
+        load_rank_ledger_handoff(link)
+
+
+def test_handoff_refuses_a_different_verified_backup(
+    tmp_path: Path,
+    envelope: dict[str, object],
+) -> None:
+    backup, manifest, handoff = _handoff_fixture(tmp_path, envelope)
+    source = _ingested_ledger(tmp_path / "newer", envelope)
+    ingest_rank_receipt_envelope(
+        build_envelope("release-2026-10-29", nonce=1),
+        {"primary": KEY},
+        source,
+        now_epoch=NOW,
+    )
+    newer_backup = tmp_path / "newer.sqlite3"
+    newer_manifest = create_rank_ledger_backup(
+        source,
+        newer_backup,
+        tmp_path / "newer.json",
+    )
+
+    with pytest.raises(PatchRunReceiptError, match="LEDGER_HANDOFF_BACKUP_MISMATCH"):
+        _verify_handoff(newer_backup, newer_manifest, handoff)
+
+    assert backup.exists()
+    assert manifest["promotion_count"] == 1
+    assert newer_manifest["promotion_count"] == 2
