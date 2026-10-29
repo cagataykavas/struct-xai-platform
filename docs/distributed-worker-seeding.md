@@ -241,6 +241,62 @@ manifest in a separate trusted control plane. A verified standby still must not 
 concurrently with the source coordinator for the same namespace: this workflow is
 safe state transfer, not leader election, fencing, or distributed consensus.
 
+### Signed standby handoff and fencing
+
+`structxai.rank_ledger_handoff` adds an authorization layer above backup integrity.
+An external controller signs one verified backup for one source controller, standby,
+authority epoch, short validity window, and downstream fence acknowledgement:
+
+```python
+from structxai.rank_ledger_handoff import (
+    create_rank_ledger_handoff,
+    restore_authorized_rank_ledger,
+)
+
+handoff = create_rank_ledger_handoff(
+    backup_path,
+    backup_manifest,
+    authority_epoch=42,
+    source_controller_id="controller-primary",
+    standby_id="controller-standby-a",
+    downstream_fence_sha256=fence_ack_sha256,
+    issued_at_epoch=issued_at,
+    expires_at_epoch=issued_at + 300,
+    key_id="handoff-primary",
+    key=controller_signing_key,
+)
+
+result = restore_authorized_rank_ledger(
+    backup_path,
+    backup_manifest,
+    handoff,
+    controller_keyring,
+    standby_ledger_path,
+    required_authority_epoch=authority_store.current_epoch(),
+    expected_source_controller_id="controller-primary",
+    expected_standby_id="controller-standby-a",
+    expected_downstream_fence_sha256=fence_service.current_ack_sha256(),
+    now_epoch=clock(),
+)
+```
+
+The HMAC-SHA256 claims bind the backup-manifest digest, physical backup digest, logical
+promotion root, controller identities, authority epoch, fence commitment, key ID, and
+validity window. Verification uses constant-time comparisons, supports key rotation by
+key ID, and requires at least 32-byte keys. Handoffs live for at most 15 minutes. Unknown
+or extra fields, duplicate JSON keys, symlinks, oversized files, weak keys, stale/future
+documents, changed backups, or any external-state mismatch fail before the restore path
+is created. Restore then repeats backup verification and retains the existing exclusive
+no-overwrite publication behavior.
+
+The `required_authority_epoch` and expected fence digest must be read independently from
+durable external systems; copying the signed values from the handoff back into those
+arguments defeats the control. The module does not allocate epochs, revoke the source,
+obtain a downstream fence, persist an epoch checkpoint, elect a leader, or provide
+consensus. HMAC authenticates parties that share the controller secret; deployments that
+need public verification or signer separation should replace this envelope with an
+external KMS-backed asymmetric signature while preserving the same claims.
+
 ## Receipt contract
 
 Receipt schema v6 binds:
