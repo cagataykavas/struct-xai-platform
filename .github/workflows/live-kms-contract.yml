@@ -1,0 +1,67 @@
+name: live-kms-contract
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: struct-xai-live-kms-contract
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    if: vars.STRUCT_XAI_KMS_LIVE_ENABLED == 'true'
+    environment: xai-kms-live
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.STRUCT_XAI_KMS_OIDC_ROLE_ARN }}
+          aws-region: ${{ vars.STRUCT_XAI_KMS_REGION }}
+          allowed-account-ids: ${{ vars.STRUCT_XAI_AWS_ACCOUNT_ID }}
+          role-session-name: struct-xai-${{ github.run_id }}-${{ github.run_attempt }}
+          unset-current-credentials: true
+          retry-max-attempts: 2
+          mask-aws-account-id: true
+      - name: Install live-contract dependencies
+        run: python -m pip install -e '.[aws]'
+      - name: Exercise exact KMS key
+        env:
+          CONTRACT_OUTPUT: ${{ runner.temp }}/struct-xai-kms-live-contract.json
+          KMS_ACCOUNT_ID: ${{ vars.STRUCT_XAI_AWS_ACCOUNT_ID }}
+          KMS_ALGORITHM: ${{ vars.STRUCT_XAI_KMS_ALGORITHM }}
+          KMS_HANDOFF_KEY_ID: ${{ vars.STRUCT_XAI_KMS_HANDOFF_KEY_ID }}
+          KMS_KEY_ARN: ${{ vars.STRUCT_XAI_KMS_KEY_ARN }}
+          KMS_REGION: ${{ vars.STRUCT_XAI_KMS_REGION }}
+        run: |
+          python -m structxai.aws_kms_live_contract \
+            --key-arn "$KMS_KEY_ARN" \
+            --region "$KMS_REGION" \
+            --expected-account-id "$KMS_ACCOUNT_ID" \
+            --handoff-key-id "$KMS_HANDOFF_KEY_ID" \
+            --algorithm "$KMS_ALGORITHM" \
+            --probe-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --observed-at-epoch "$(date +%s)" \
+            --output "$CONTRACT_OUTPUT"
+      - name: Publish sanitized contract evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: struct-xai-kms-live-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/struct-xai-kms-live-contract.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Remove local contract evidence
+        if: always()
+        run: rm -f "${{ runner.temp }}/struct-xai-kms-live-contract.json"

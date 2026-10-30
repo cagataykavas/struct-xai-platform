@@ -292,6 +292,7 @@ structxai/
   rank_ledger_backup.py verified online backup and no-overwrite standby restore
   rank_ledger_handoff.py HMAC or external-signature standby authorization
   aws_kms_handoff.py canonical AWS KMS asymmetric signer/verifier adapter
+  aws_kms_live_contract.py bounded opt-in live KMS probe and sanitized evidence
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation
