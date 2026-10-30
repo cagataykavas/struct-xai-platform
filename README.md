@@ -291,6 +291,7 @@ structxai/
   rank_receipt_ingestion.py replay-protected all-rank coordinator ingestion
   rank_ledger_backup.py verified online backup and no-overwrite standby restore
   rank_ledger_handoff.py HMAC or external-signature standby authorization
+  aws_kms_handoff.py canonical AWS KMS asymmetric signer/verifier adapter
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation
@@ -319,7 +320,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - fail-closed local-worker acknowledgment manifests with cross-process validation;
 - coordinator-side all-rank acknowledgment aggregation for promotion gates;
 - replay-ledger online backup, logical integrity manifests, and standby restore;
-- signed, short-lived authority handoffs with external epoch/fence checks and immutable external key revisions;
+- signed, short-lived authority handoffs with external epoch/fence checks, immutable external key revisions, and an AWS KMS adapter contract;
 - deterministic distributed-sampler orders, mutation checks, and receipt binding;
 - content-addressed dataset manifests and cross-seed dataset identity checks;
 - HTML report generation;
@@ -340,7 +341,7 @@ The repository tries to make its limitations visible:
 - cross-run stability measures repeatability, not truth;
 - dataset manifests authenticate caller-canonicalized bytes, not their semantic correctness or origin;
 - a visually clean heatmap is not treated as evidence without an explicit metric and experiment identity.
-- signed handoffs authenticate state transfer but do not allocate epochs, fence a source, or provide consensus; external adapters still depend on provider policy and availability.
+- signed handoffs authenticate state transfer but do not allocate epochs, fence a source, or provide consensus; the AWS adapter validates key metadata and response identity but still depends on IAM, client timeouts, provider availability, and independently protected epochs.
 
 ## Research directions
 

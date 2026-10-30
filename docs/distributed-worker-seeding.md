@@ -355,6 +355,51 @@ must enforce an asymmetric algorithm, an immutable enabled key version, bounded 
 deadlines and reviewed sign/verify permissions. The external authority epoch and fence
 must still come from independent rollback-resistant control-plane systems.
 
+#### AWS KMS adapter
+
+`AwsKmsHandoffAdapter` implements the signer and verifier protocols over an injected boto3
+KMS client. Install the optional dependency with `pip install -e '.[aws]'`, configure bounded
+SDK timeouts/retries, and keep signer and verifier IAM roles separate where possible:
+
+```python
+import boto3
+from botocore.config import Config
+
+from structxai.aws_kms_handoff import AwsKmsHandoffAdapter
+
+kms = boto3.client(
+    "kms",
+    region_name="eu-central-1",
+    config=Config(
+        connect_timeout=2,
+        read_timeout=5,
+        retries={"mode": "standard", "total_max_attempts": 2},
+    ),
+)
+kms_signer = AwsKmsHandoffAdapter(
+    kms,
+    kms_key_ref="alias/struct-xai-handoff",
+    handoff_key_id="primary-handoff-key",
+    algorithm="ECDSA-P256-SHA256",
+)
+```
+
+Initialization resolves an alias once with `DescribeKey`, requires a customer-managed,
+enabled `SIGN_VERIFY` key, then fetches its public-key DER through the canonical key ARN.
+All later `Sign` and `Verify` calls use that ARN—not the mutable alias. The immutable
+revision commitment binds the ARN, provider key ID, key spec, signing algorithm and
+public-key digest. Every cryptographic response must echo the canonical key identity and
+algorithm; wrong-key, wrong-algorithm, non-boolean and malformed responses fail closed.
+
+The supported mappings are P-256 with `ECDSA_SHA_256`, or RSA-2048/3072/4096 with
+`RSASSA_PSS_SHA_256` or `RSASSA_PKCS1_V1_5_SHA_256`. AWS KMS does not expose the
+provider-neutral adapter's Ed25519 option. Raw canonical claims are bounded to the KMS
+4 KiB request limit. A signing role needs `kms:DescribeKey`, `kms:GetPublicKey` and
+`kms:Sign` on the exact key ARN; a verification role substitutes `kms:Verify` for
+`kms:Sign`. The adapter does not configure those policies, inspect boto3 timeout settings,
+or claim live-provider validation. Contract tests use an in-memory request/response fake
+and assert the exact KMS parameters and fail-closed response checks.
+
 ## Receipt contract
 
 Receipt schema v6 binds:
