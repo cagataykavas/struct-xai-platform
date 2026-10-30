@@ -400,6 +400,34 @@ provider-neutral adapter's Ed25519 option. Raw canonical claims are bounded to t
 or claim live-provider validation. Contract tests use an in-memory request/response fake
 and assert the exact KMS parameters and fail-closed response checks.
 
+#### Opt-in live KMS contract
+
+`.github/workflows/live-kms-contract.yml` provides a manual, environment-protected probe for
+deployments that configure `xai-kms-live`. It is disabled unless
+`STRUCT_XAI_KMS_LIVE_ENABLED` is exactly `true` and uses GitHub OIDC to assume the role in
+`STRUCT_XAI_KMS_OIDC_ROLE_ARN`; no static AWS credential is accepted by the workflow. Set these
+environment variables before dispatching it:
+
+- `STRUCT_XAI_AWS_ACCOUNT_ID`: the exact 12-digit account allowed during role assumption;
+- `STRUCT_XAI_KMS_REGION`: the exact region embedded in the key ARN;
+- `STRUCT_XAI_KMS_KEY_ARN`: a canonical customer-managed key ARN, never an alias;
+- `STRUCT_XAI_KMS_HANDOFF_KEY_ID`: the public logical identifier committed into handoffs;
+- `STRUCT_XAI_KMS_ALGORITHM`: one reviewed algorithm supported by the adapter.
+
+The probe constructs a boto3 client with two-second connect and five-second read deadlines and at
+most two standard-mode attempts. It resolves and validates the exact key, signs a run-bound
+challenge, requires positive verification, and requires the same signature to fail against a
+modified challenge. The raw challenge, signature, account ID and key ARN are not retained. The
+sanitized evidence contains hashed probe/key identities, public-key and key-revision commitments,
+the algorithm and both verdicts. It is written atomically with mode `0600`, uploaded for one day,
+and removed from the runner even when the job fails.
+
+The action references are immutable commit pins. The OIDC role should additionally restrict the
+GitHub `sub` claim to this repository and the `xai-kms-live` environment, and grant only
+`kms:DescribeKey`, `kms:GetPublicKey`, `kms:Sign` and `kms:Verify` on the exact key ARN. This probe
+does not create or rotate a key, configure trust/IAM policy, inspect CloudTrail delivery, prove
+provider availability beyond one run, or establish independent epoch rollback protection.
+
 ## Receipt contract
 
 Receipt schema v6 binds:
