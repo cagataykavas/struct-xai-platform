@@ -27,7 +27,7 @@ That separation is reflected directly in the codebase.
 | Prompt interventions | reproducible literal deletion and replacement |
 | Causal intervention | single-layer patching plus bounded layer × dose sweeps with prespecified promotion gates |
 | Quantitative evaluation | mean/max margin shift, final winner change, sign-flip count, intervention sensitivity |
-| Repeatability | cross-run Pearson correlation, sign agreement, absolute margin drift, final-winner agreement |
+| Repeatability | pairwise diagnostics plus a prespecified multi-run gate with bounded all-pairs evidence |
 | Provenance | experiment fingerprint, prompt/candidate SHA-256, model, metric, device/dtype, runtime versions, source revision |
 | Artifact validation | prompt/model/fingerprint checks and base-vs-variant layer alignment |
 | Outputs | JSON experiment artifacts and standalone HTML reports |
@@ -158,6 +158,44 @@ final pairwise winner agreement
 ```
 
 These metrics quantify **repeatability of the measured decision trace**. A high correlation is not claimed to prove causal faithfulness; faithfulness and repeatability are kept as separate concepts.
+
+For release or CI decisions, use a cohort rather than selecting one convenient
+pair of runs after the fact:
+
+```python
+from structxai.stability import (
+    StabilityCohortPolicy,
+    require_artifact_stability_cohort,
+)
+
+evidence = require_artifact_stability_cohort(
+    {
+        "seed-11": run_a,
+        "seed-22": run_b,
+        "seed-33": run_c,
+    },
+    policy=StabilityCohortPolicy(
+        min_pairwise_pearson=0.95,
+        min_pairwise_sign_agreement=0.95,
+        max_pairwise_mean_abs_margin_difference=0.05,
+        max_final_margin_range=0.05,
+    ),
+)
+```
+
+The gate requires three or more artifacts with identical experiment metadata,
+experiment fingerprints, candidate sets, and layer indices. It evaluates every
+run pair, reports stable finding codes, and can require final-winner unanimity.
+Inputs and work are bounded, non-finite scores are rejected, and the evidence is
+deterministic regardless of mapping order. The report commits to each run with
+SHA-256 while omitting the raw prompt and layer scores, so CI can retain a
+privacy-reduced decision record.
+
+Prespecify both the run cohort and policy thresholds before executing the
+experiment. This is a descriptive repeatability gate over a finite set of runs:
+it does not establish causal faithfulness, population-level generalization, or
+independence between runs. Its digests provide integrity evidence, not signer
+authentication.
 
 ## 5. Activation patching
 

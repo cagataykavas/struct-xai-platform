@@ -1,13 +1,33 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
 from structxai.evaluation import evaluate_interventions
-from structxai.stability import compare_runs
+from structxai.stability import audit_artifact_stability_cohort, compare_runs
 
 CANDIDATES = ("A", "B", "C")
+EXPERIMENT = {
+    "prompt": "Synthetic prompt",
+    "candidates": list(CANDIDATES),
+    "model_name": "synthetic-model",
+}
+
+
+def digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+
+
+def artifact(base: dict[str, object]) -> dict[str, object]:
+    return {
+        "experiment": EXPERIMENT,
+        "base": base,
+        "provenance": {"experiment_fingerprint": digest(EXPERIMENT)},
+    }
 
 
 def analysis(rows: list[tuple[float, float, float]]) -> dict[str, object]:
@@ -59,6 +79,14 @@ def build_report() -> dict[str, object]:
             (0.307, 0.153, 0.071),
         ]
     )
+    second_repeat = analysis(
+        [
+            (0.039, 0.021, -0.009),
+            (0.102, 0.058, 0.011),
+            (0.192, 0.108, 0.039),
+            (0.313, 0.147, 0.069),
+        ]
+    )
 
     interventions = evaluate_interventions(
         base,
@@ -69,6 +97,15 @@ def build_report() -> dict[str, object]:
         CANDIDATES,
     )
     stability = compare_runs(base, repeat, CANDIDATES)
+    stability_cohort = audit_artifact_stability_cohort(
+        {
+            "seed-11": artifact(base),
+            "seed-22": artifact(repeat),
+            "seed-33": artifact(second_repeat),
+        }
+    )
+    if not stability_cohort["accepted"]:
+        raise RuntimeError("synthetic stability cohort unexpectedly failed its policy")
 
     return {
         "scope": "synthetic reproducibility evidence",
@@ -79,6 +116,7 @@ def build_report() -> dict[str, object]:
         "candidates": list(CANDIDATES),
         "intervention_evaluation": interventions,
         "cross_run_stability": stability,
+        "stability_cohort": stability_cohort,
     }
 
 
@@ -93,6 +131,9 @@ def markdown(report: dict[str, object]) -> str:
     pairs = interventions["pairs"]
     assert isinstance(pairs, list)
 
+    cohort = report["stability_cohort"]
+    assert isinstance(cohort, dict)
+
     lines = [
         "# Struct-XAI Synthetic Reproducibility Evidence",
         "",
@@ -104,6 +145,8 @@ def markdown(report: dict[str, object]) -> str:
         f"- Mean sign agreement: `{float(summary['mean_sign_agreement_rate']):.6f}`",
         f"- Mean absolute margin difference: `{float(summary['mean_abs_margin_difference']):.6f}`",
         f"- Final pairwise winners all agree: `{bool(summary['all_final_pairwise_winners_agree'])}`",
+        f"- Prespecified three-run cohort accepted: `{bool(cohort['accepted'])}`",
+        f"- Cohort evidence SHA-256: `{cohort['evidence_sha256']}`",
         "",
         "## Intervention sensitivity",
         "",
