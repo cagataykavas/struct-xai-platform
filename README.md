@@ -197,6 +197,50 @@ it does not establish causal faithfulness, population-level generalization, or
 independence between runs. Its digests provide integrity evidence, not signer
 authentication.
 
+To move from one experiment to a prespecified task cohort, aggregate the
+privacy-reduced run-cohort reports rather than treating their dependent run
+pairs as independent samples:
+
+```python
+from structxai.stability_uncertainty import (
+    StabilityTaskCohortPolicy,
+    require_stability_task_cohort,
+)
+
+evidence = require_stability_task_cohort(
+    {
+        "task-001": task_001_stability_report,
+        "task-002": task_002_stability_report,
+        # At least eight independently selected tasks.
+    },
+    policy=StabilityTaskCohortPolicy(
+        confidence_level=0.95,
+        bootstrap_resamples=2_000,
+        bootstrap_seed=20261031,
+    ),
+)
+```
+
+The task audit requires the same run policy and run count for every task,
+rejects duplicate experiment commitments, and uses each whole task as the
+resampling unit. It reports percentile-bootstrap intervals for the mean
+task-level worst-pair Pearson correlation, sign agreement, margin drift, and
+final-margin range. The accepted-task rate uses a Wilson interval so an
+all-passing small cohort does not receive a falsely perfect lower bound. Work
+is bounded to 256 tasks and 20,000 resamples, and a counter-based SHA-256 index
+stream makes evidence reproducible without relying on process-global RNG
+state. This follows the nonparametric resampling principle introduced by
+[Efron (1979)](https://doi.org/10.1214/aos/1176344552), while keeping the task
+as the independent unit.
+
+Prespecify and pin the task list, task-selection protocol, run policy,
+thresholds, confidence level, resample count, and seed before evaluation. The
+intervals only characterize variation across the supplied task cohort under an
+independent, representative-task assumption. They do not repair task-selection
+bias, prove population generalization or causal faithfulness, or authenticate
+the input reports. The retained output commits to task and report identities
+without storing prompts or layer scores.
+
 ## 5. Activation patching
 
 ```bash
