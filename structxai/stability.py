@@ -60,7 +60,7 @@ class StabilityCohortPolicy:
             ("min_pairwise_sign_agreement", self.min_pairwise_sign_agreement),
         ):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{name} must be numeric")
+                raise TypeError(f"{name} must be numeric")
             if not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
                 raise ValueError(f"{name} must be finite and between zero and one")
         for name, value in (
@@ -71,7 +71,7 @@ class StabilityCohortPolicy:
             ("max_final_margin_range", self.max_final_margin_range),
         ):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{name} must be numeric")
+                raise TypeError(f"{name} must be numeric")
             if not math.isfinite(float(value)) or float(value) < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
         if type(self.require_final_winner_unanimity) is not bool:

@@ -166,6 +166,18 @@ def test_stability_cohort_policy_is_bounded(kwargs, match):
         StabilityCohortPolicy(**kwargs)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_pairwise_pearson": True},
+        {"max_pairwise_mean_abs_margin_difference": "0.05"},
+    ],
+)
+def test_stability_cohort_policy_rejects_non_numeric_thresholds(kwargs):
+    with pytest.raises(TypeError, match="must be numeric"):
+        StabilityCohortPolicy(**kwargs)
+
+
 def test_stability_cohort_requires_enough_runs_and_canonical_ids():
     with pytest.raises(StabilityGateError, match="run count"):
         audit_artifact_stability_cohort(
