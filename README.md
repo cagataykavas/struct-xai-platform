@@ -241,6 +241,72 @@ bias, prove population generalization or causal faithfulness, or authenticate
 the input reports. The retained output commits to task and report identities
 without storing prompts or layer scores.
 
+### Prespecified public-task manifest and signed evidence
+
+`structxai.stability_manifest` closes the input-authentication gap at the
+evidence boundary. Create the manifest **before** running the cohort: it binds
+the exact task IDs and experiment commitments, dataset records, selection
+protocol, model weights, tokenizer, run policy, and task-level uncertainty
+policy. Dataset and model revisions must be immutable 40- to 64-character
+hexadecimal revisions; the selected records and artifacts receive separate
+SHA-256 commitments.
+
+```python
+from structxai.stability_manifest import (
+    create_signed_stability_task_evidence,
+    create_stability_task_manifest,
+    verify_signed_stability_task_evidence,
+)
+from structxai.stability_uncertainty import StabilityTaskCohortPolicy
+
+manifest = create_stability_task_manifest(
+    prespecified_task_experiment_hashes,
+    cohort_id="public-xai-v1",
+    dataset_uri=public_dataset_uri,
+    dataset_revision=dataset_commit,
+    dataset_records_sha256=selected_records_sha256,
+    selection_protocol_uri=public_protocol_uri,
+    selection_protocol_sha256=selection_protocol_sha256,
+    model_uri=public_model_uri,
+    model_revision=model_commit,
+    model_weights_sha256=model_weights_sha256,
+    tokenizer_sha256=tokenizer_sha256,
+    run_cohort_policy_sha256=run_policy_sha256,
+    task_cohort_policy=StabilityTaskCohortPolicy(
+        confidence_level=0.95,
+        bootstrap_resamples=2_000,
+        bootstrap_seed=20261101,
+    ),
+)
+
+bundle = create_signed_stability_task_evidence(
+    manifest,
+    completed_task_reports,
+    signer=kms_adapter,
+)
+verification = verify_signed_stability_task_evidence(
+    bundle,
+    {kms_adapter.key_id: kms_adapter},
+)
+```
+
+Signing recomputes the cohort audit from the raw task reports and refuses a
+task substitution, policy change, or rejected result. The provider-neutral
+signer/verifier interface is structurally compatible with the existing
+`AwsKmsHandoffAdapter`; only compact digest claims are sent to the external
+signer, keeping the message below its 4 KiB raw-message limit. Verification
+checks the retained manifest and report digests, their exact task and policy
+bindings, the immutable key revision, and the asymmetric signature.
+
+This boundary detects evidence substitution; it is not a trusted timestamp or
+remote attestation system. A signature made after seeing results does not prove
+that the manifest was prespecified, and declared artifact hashes do not prove
+that an unmeasured runtime actually loaded them. Publish the manifest digest in
+an append-only external record before evaluation and have the evaluation runner
+verify loaded artifacts when those guarantees are required. Public provenance
+also does not make a selected cohort representative or prove causal
+faithfulness.
+
 ## 5. Activation patching
 
 ```bash
@@ -377,6 +443,8 @@ structxai/
   aws_kms_live_contract.py bounded opt-in live KMS probe and sanitized evidence
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
+  stability_uncertainty.py task-resampled confidence intervals and policy gate
+  stability_manifest.py prespecified public-task manifest and signed evidence
   provenance.py      fingerprints and artifact validation
   experiment.py      experiment orchestration
   report.py          standalone HTML reporting
@@ -442,3 +510,4 @@ Next research-oriented extensions include:
 ## Interview topics
 
 **logit lens · hidden states · candidate margins · sign flips · controlled interventions · activation patching · causal vs correlational explanation · explanation faithfulness · repeatability · experiment provenance · artifact validation · model hooks · reproducible research systems · FastAPI · Docker · CI.**
+
