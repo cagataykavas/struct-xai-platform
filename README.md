@@ -298,14 +298,51 @@ signer, keeping the message below its 4 KiB raw-message limit. Verification
 checks the retained manifest and report digests, their exact task and policy
 bindings, the immutable key revision, and the asymmetric signature.
 
+Before evaluating a published manifest, bind it to the concrete runtime inputs
+with `run_manifest_locked_stability_cohort`. The gate requires the independently
+published manifest digest, reconstructs the existing ordered dataset and bounded
+model/tokenizer artifact manifests, checks the exact selection-protocol bytes,
+and only then invokes the cohort callback:
+
+```python
+from structxai.stability_runtime import run_manifest_locked_stability_cohort
+
+task_reports, runtime_evidence = run_manifest_locked_stability_cohort(
+    manifest,
+    expected_manifest_sha256=published_manifest_sha256,
+    model_path=downloaded_model_directory,
+    tokenizer_path=downloaded_tokenizer_directory,
+    dataset_examples=selected_dataset_examples,
+    selection_protocol=selection_protocol_bytes,
+    runner=run_public_stability_cohort,
+)
+
+bundle = create_signed_stability_task_evidence(
+    manifest,
+    task_reports,
+    signer=kms_adapter,
+)
+```
+
+The callback receives resolved, preflight-verified artifact paths and immutable
+dataset/protocol values. Its output must contain every committed task with the
+exact experiment identity. Reports are canonicalized into a detached snapshot,
+and model, tokenizer, and dataset commitments are checked again after execution.
+The privacy-reduced runtime evidence binds the input set and full report digests
+without retaining prompts, records, weights, or protocol contents. Callback and
+filesystem failures are converted to stable errors rather than copying private
+diagnostics.
+
 This boundary detects evidence substitution; it is not a trusted timestamp or
 remote attestation system. A signature made after seeing results does not prove
 that the manifest was prespecified, and declared artifact hashes do not prove
-that an unmeasured runtime actually loaded them. Publish the manifest digest in
-an append-only external record before evaluation and have the evaluation runner
-verify loaded artifacts when those guarantees are required. Public provenance
-also does not make a selected cohort representative or prove causal
-faithfulness.
+that a malicious callback actually used the verified paths. The runtime gate
+narrows accidental substitution and time-of-check/time-of-use drift, but it does
+not attest the process, accelerator, dependency graph, or model execution.
+Publish the manifest digest in an append-only external record before evaluation
+and use an independently attested runner when stronger execution claims are
+required. Public provenance also does not make a selected cohort representative
+or prove causal faithfulness.
 
 ## 5. Activation patching
 
@@ -445,6 +482,7 @@ structxai/
   stability.py       cross-run repeatability metrics
   stability_uncertainty.py task-resampled confidence intervals and policy gate
   stability_manifest.py prespecified public-task manifest and signed evidence
+  stability_runtime.py manifest-locked runtime input and report commitments
   provenance.py      fingerprints and artifact validation
   experiment.py      experiment orchestration
   report.py          standalone HTML reporting
