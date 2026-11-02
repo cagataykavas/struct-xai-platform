@@ -8,6 +8,7 @@ import pytest
 from structxai.stability import audit_artifact_stability_cohort
 from structxai.stability_lineage import (
     StabilityLineageError,
+    create_manifest_publication_reference,
     create_runtime_bound_stability_evidence,
     verify_runtime_bound_stability_evidence,
 )
@@ -58,6 +59,15 @@ def _alternate_reports() -> dict[str, dict]:
     }
 
 
+def _publication(manifest: dict[str, object]) -> dict[str, object]:
+    return create_manifest_publication_reference(
+        publication_uri="https://evidence.example/struct-xai/public-cohort-v1.json",
+        publication_record_sha256=hashlib.sha256(b"public-manifest-record-v1").hexdigest(),
+        manifest_sha256=str(manifest["manifest_sha256"]),
+        published_at_epoch=1_799_000_000,
+    )
+
+
 def test_lineage_envelope_verifies_runtime_and_signed_cohort_as_one_unit(tmp_path) -> None:
     manifest, reports, runtime_evidence = _runtime_run(tmp_path)
     adapter = _CountingAdapter()
@@ -66,6 +76,7 @@ def test_lineage_envelope_verifies_runtime_and_signed_cohort_as_one_unit(tmp_pat
         manifest,
         reports,
         runtime_evidence,
+        _publication(manifest),
         signer=adapter,
     )
     verification = verify_runtime_bound_stability_evidence(
@@ -76,6 +87,13 @@ def test_lineage_envelope_verifies_runtime_and_signed_cohort_as_one_unit(tmp_pat
     assert adapter.sign_calls == 2
     assert verification["verified"] is True
     assert verification["manifest_sha256"] == manifest["manifest_sha256"]
+    assert (
+        verification["manifest_publication_reference_sha256"]
+        == bundle["manifest_publication_reference_sha256"]
+    )
+    assert (
+        verification["publication_record_sha256"] == hashlib.sha256(b"public-manifest-record-v1").hexdigest()
+    )
     assert verification["runtime_evidence_sha256"] == runtime_evidence.evidence_sha256
     assert verification["report_commitments_sha256"] == (runtime_evidence.report_commitments_sha256)
     assert "record-0" not in str(bundle)
@@ -93,6 +111,7 @@ def test_lineage_creation_rejects_valid_reports_from_a_different_runtime_run(tmp
             manifest,
             alternate_reports,
             runtime_evidence,
+            _publication(manifest),
             signer=adapter,
         )
 
@@ -111,6 +130,7 @@ def test_lineage_creation_rejects_runtime_evidence_from_a_different_report_set(t
             manifest,
             reports,
             alternate_runtime,
+            _publication(manifest),
             signer=_CountingAdapter(),
         )
 
@@ -125,6 +145,7 @@ def test_lineage_rejects_tampered_runtime_input_and_evidence_digests(tmp_path) -
             manifest,
             reports,
             runtime_document,
+            _publication(manifest),
             signer=_CountingAdapter(),
         )
 
@@ -135,6 +156,7 @@ def test_lineage_rejects_tampered_runtime_input_and_evidence_digests(tmp_path) -
             manifest,
             reports,
             runtime_document,
+            _publication(manifest),
             signer=_CountingAdapter(),
         )
 
@@ -147,6 +169,7 @@ def test_verification_rejects_nested_artifact_tampering(tmp_path, target: str) -
         manifest,
         reports,
         runtime_evidence,
+        _publication(manifest),
         signer=adapter,
     )
     tampered = copy.deepcopy(bundle)
@@ -166,6 +189,7 @@ def test_verification_rejects_outer_digest_claim_and_signature_tampering(tmp_pat
         manifest,
         reports,
         runtime_evidence,
+        _publication(manifest),
         signer=adapter,
     )
 
@@ -187,6 +211,7 @@ def test_lineage_requires_exact_schema_and_known_key(tmp_path) -> None:
         manifest,
         reports,
         runtime_evidence,
+        _publication(manifest),
         signer=adapter,
     )
 
@@ -206,7 +231,75 @@ def test_lineage_signing_failure_is_sanitized(tmp_path) -> None:
             manifest,
             reports,
             runtime_evidence,
+            _publication(manifest),
             signer=_FailSecondSigner(),
         )
 
     assert "private provider diagnostic" not in str(error.value)
+
+
+def test_verification_rejects_publication_reference_substitution(tmp_path) -> None:
+    manifest, reports, runtime_evidence = _runtime_run(tmp_path)
+    adapter = _CountingAdapter()
+    bundle = create_runtime_bound_stability_evidence(
+        manifest,
+        reports,
+        runtime_evidence,
+        _publication(manifest),
+        signer=adapter,
+    )
+
+    tampered = copy.deepcopy(bundle)
+    tampered["manifest_publication_reference"]["publication_uri"] = (
+        "https://evidence.example/struct-xai/replacement.json"
+    )
+
+    with pytest.raises(StabilityLineageError, match="digest claims"):
+        verify_runtime_bound_stability_evidence(tampered, {adapter.key_id: adapter})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("publication_uri", "http://evidence.example/manifest.json", "URI is invalid"),
+        (
+            "publication_uri",
+            "https://user:secret@evidence.example/manifest.json",
+            "URI is invalid",
+        ),
+        (
+            "publication_uri",
+            "https://evidence.example/manifest.json?mutable=yes",
+            "URI is invalid",
+        ),
+        (
+            "publication_uri",
+            "https://evidence.example/manifest.json\n",
+            "URI is invalid",
+        ),
+        ("manifest_sha256", "0" * 64, "does not match the manifest"),
+        ("publication_record_sha256", "not-a-digest", "record digest is invalid"),
+        ("published_at_epoch", True, "epoch is invalid"),
+    ],
+)
+def test_creation_rejects_invalid_publication_reference_before_signing(
+    tmp_path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    manifest, reports, runtime_evidence = _runtime_run(tmp_path)
+    reference = _publication(manifest)
+    reference[field] = value
+    adapter = _CountingAdapter()
+
+    with pytest.raises(StabilityLineageError, match=message):
+        create_runtime_bound_stability_evidence(
+            manifest,
+            reports,
+            runtime_evidence,
+            reference,
+            signer=adapter,
+        )
+
+    assert adapter.sign_calls == 0
