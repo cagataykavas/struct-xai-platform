@@ -8,6 +8,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import asdict
+from urllib.parse import urlsplit
 
 from structxai.stability_manifest import (
     EXTERNAL_SIGNATURE_ALGORITHMS,
@@ -26,9 +27,10 @@ from structxai.stability_runtime import (
     StabilityRuntimeEvidence,
 )
 
-RUNTIME_BOUND_STABILITY_EVIDENCE_SCHEMA = "struct-xai-runtime-bound-stability-evidence/v1"
+RUNTIME_BOUND_STABILITY_EVIDENCE_SCHEMA = "struct-xai-runtime-bound-stability-evidence/v2"
 RUNTIME_BOUND_STABILITY_EVIDENCE_PURPOSE = "runtime-bound-prespecified-task-stability-evidence"
-RUNTIME_BOUND_STABILITY_VERIFICATION_SCHEMA = "struct-xai-runtime-bound-stability-verification/v1"
+RUNTIME_BOUND_STABILITY_VERIFICATION_SCHEMA = "struct-xai-runtime-bound-stability-verification/v2"
+MANIFEST_PUBLICATION_REFERENCE_SCHEMA = "struct-xai-manifest-publication-reference/v1"
 
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -54,6 +56,8 @@ _BUNDLE_FIELDS = {
     "key_id",
     "key_revision_sha256",
     "manifest_sha256",
+    "manifest_publication_reference",
+    "manifest_publication_reference_sha256",
     "cohort_evidence_sha256",
     "runtime_evidence_sha256",
     "report_commitments_sha256",
@@ -63,7 +67,19 @@ _BUNDLE_FIELDS = {
     "runtime_evidence",
     "signature",
 }
-_SIGNED_CLAIM_FIELDS = _BUNDLE_FIELDS - {"signed_evidence", "runtime_evidence", "signature"}
+_SIGNED_CLAIM_FIELDS = _BUNDLE_FIELDS - {
+    "manifest_publication_reference",
+    "signed_evidence",
+    "runtime_evidence",
+    "signature",
+}
+_PUBLICATION_FIELDS = {
+    "schema_version",
+    "publication_uri",
+    "publication_record_sha256",
+    "manifest_sha256",
+    "published_at_epoch",
+}
 _INPUT_DIGEST_FIELDS = (
     "dataset_records_sha256",
     "selection_protocol_sha256",
@@ -236,10 +252,79 @@ def _signed_claims(bundle: Mapping[str, object]) -> dict[str, object]:
     return {key: bundle[key] for key in _SIGNED_CLAIM_FIELDS}
 
 
+def _validate_manifest_publication_reference(
+    reference: object,
+    expected_manifest_sha256: object,
+) -> dict[str, object]:
+    if not isinstance(reference, Mapping) or set(reference) != _PUBLICATION_FIELDS:
+        raise StabilityLineageError("manifest publication reference must use the exact schema")
+    document = dict(reference)
+    uri = document.get("publication_uri")
+    try:
+        parsed = urlsplit(uri) if isinstance(uri, str) else None
+        port = parsed.port if parsed is not None else None
+    except ValueError as exc:
+        raise StabilityLineageError("manifest publication URI is invalid") from exc
+    if (
+        document.get("schema_version") != MANIFEST_PUBLICATION_REFERENCE_SCHEMA
+        or not isinstance(uri, str)
+        or not 1 <= len(uri) <= 2_048
+        or not uri.isascii()
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in uri)
+        or parsed is None
+        or parsed.geturl() != uri
+        or parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise StabilityLineageError("manifest publication URI is invalid")
+    manifest_sha256 = document.get("manifest_sha256")
+    if not _is_digest(manifest_sha256) or not _same(
+        manifest_sha256,
+        expected_manifest_sha256,
+    ):
+        raise StabilityLineageError("manifest publication reference does not match the manifest")
+    if not _is_digest(document.get("publication_record_sha256")):
+        raise StabilityLineageError("manifest publication record digest is invalid")
+    published_at_epoch = document.get("published_at_epoch")
+    if (
+        isinstance(published_at_epoch, bool)
+        or not isinstance(published_at_epoch, int)
+        or not 1 <= published_at_epoch <= (1 << 53) - 1
+    ):
+        raise StabilityLineageError("manifest publication epoch is invalid")
+    return json.loads(_canonical_json(document))
+
+
+def create_manifest_publication_reference(
+    *,
+    publication_uri: str,
+    publication_record_sha256: str,
+    manifest_sha256: str,
+    published_at_epoch: int,
+) -> dict[str, object]:
+    """Create a strict reference to one externally retained manifest record."""
+
+    document: dict[str, object] = {
+        "schema_version": MANIFEST_PUBLICATION_REFERENCE_SCHEMA,
+        "publication_uri": publication_uri,
+        "publication_record_sha256": publication_record_sha256,
+        "manifest_sha256": manifest_sha256,
+        "published_at_epoch": published_at_epoch,
+    }
+    return _validate_manifest_publication_reference(document, manifest_sha256)
+
+
 def create_runtime_bound_stability_evidence(
     manifest: dict[str, object],
     task_reports: Mapping[str, dict],
     runtime_evidence: StabilityRuntimeEvidence | Mapping[str, object],
+    manifest_publication_reference: Mapping[str, object],
     *,
     signer: ExternalEvidenceSigner,
 ) -> dict[str, object]:
@@ -250,6 +335,10 @@ def create_runtime_bound_stability_evidence(
     except StabilityTaskManifestError as exc:
         raise StabilityLineageError("stability manifest is invalid") from exc
     runtime_document = _validate_runtime_evidence(runtime_evidence, normalized_manifest)
+    publication_reference = _validate_manifest_publication_reference(
+        manifest_publication_reference,
+        normalized_manifest["manifest_sha256"],
+    )
     normalized_reports, report_commitments_sha256 = _report_commitments(
         task_reports,
         normalized_manifest,
@@ -279,6 +368,7 @@ def create_runtime_bound_stability_evidence(
         "key_id": key_id,
         "key_revision_sha256": key_revision,
         "manifest_sha256": normalized_manifest["manifest_sha256"],
+        "manifest_publication_reference_sha256": _digest(publication_reference),
         "cohort_evidence_sha256": signed_evidence["cohort_evidence_sha256"],
         "runtime_evidence_sha256": runtime_document["evidence_sha256"],
         "report_commitments_sha256": report_commitments_sha256,
@@ -286,6 +376,7 @@ def create_runtime_bound_stability_evidence(
         "task_count": len(normalized_manifest["tasks"]),
         "signed_evidence": signed_evidence,
         "runtime_evidence": runtime_document,
+        "manifest_publication_reference": publication_reference,
     }
     try:
         signature = signer.sign(_canonical_json(_signed_claims(bundle)))
@@ -318,7 +409,12 @@ def verify_runtime_bound_stability_evidence(
     except StabilityTaskManifestError as exc:
         raise StabilityLineageError("signed cohort evidence is invalid") from exc
     runtime_document = _validate_runtime_evidence(bundle.get("runtime_evidence"), manifest)
+    publication_reference = _validate_manifest_publication_reference(
+        bundle.get("manifest_publication_reference"),
+        manifest["manifest_sha256"],
+    )
     for value in (
+        bundle.get("manifest_publication_reference_sha256"),
         bundle.get("runtime_evidence_sha256"),
         bundle.get("report_commitments_sha256"),
         bundle.get("signed_evidence_sha256"),
@@ -327,6 +423,10 @@ def verify_runtime_bound_stability_evidence(
             raise StabilityLineageError("runtime-bound evidence contains an invalid digest")
     if (
         not _same(bundle.get("manifest_sha256"), signed_verification["manifest_sha256"])
+        or not _same(
+            bundle.get("manifest_publication_reference_sha256"),
+            _digest(publication_reference),
+        )
         or not _same(
             bundle.get("cohort_evidence_sha256"),
             signed_verification["cohort_evidence_sha256"],
@@ -372,6 +472,9 @@ def verify_runtime_bound_stability_evidence(
         "cohort_id": runtime_document["cohort_id"],
         "task_count": signed_verification["task_count"],
         "manifest_sha256": signed_verification["manifest_sha256"],
+        "manifest_publication_reference_sha256": bundle["manifest_publication_reference_sha256"],
+        "publication_record_sha256": publication_reference["publication_record_sha256"],
+        "published_at_epoch": publication_reference["published_at_epoch"],
         "cohort_evidence_sha256": signed_verification["cohort_evidence_sha256"],
         "runtime_evidence_sha256": runtime_document["evidence_sha256"],
         "report_commitments_sha256": runtime_document["report_commitments_sha256"],

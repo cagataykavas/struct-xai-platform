@@ -351,14 +351,22 @@ could otherwise be paired after the fact. Use
 
 ```python
 from structxai.stability_lineage import (
+    create_manifest_publication_reference,
     create_runtime_bound_stability_evidence,
     verify_runtime_bound_stability_evidence,
 )
 
+publication_reference = create_manifest_publication_reference(
+    publication_uri=immutable_publication_uri,
+    publication_record_sha256=publication_record_sha256,
+    manifest_sha256=manifest["manifest_sha256"],
+    published_at_epoch=published_at_epoch,
+)
 lineage_bundle = create_runtime_bound_stability_evidence(
     manifest,
     task_reports,
     runtime_evidence,
+    publication_reference,
     signer=kms_adapter,
 )
 verification = verify_runtime_bound_stability_evidence(
@@ -369,15 +377,24 @@ verification = verify_runtime_bound_stability_evidence(
 
 The creator recomputes each full task-report commitment, requires the runtime
 record to commit to that exact report set, produces the existing signed cohort
-evidence, and signs a compact outer claim over both retained artifact digests.
-Verification checks the nested cohort signature, runtime evidence schema and
-input bindings, exact task/report commitment, immutable key revision, and outer
-lineage signature. The envelope retains hashes and accepted aggregate evidence,
-not dataset payloads, prompts, model weights, or layer scores.
+evidence, and signs a compact outer claim over both retained artifact digests
+and the canonical publication-reference digest. The strict reference records a
+printable-ASCII HTTPS URI without credentials, query, fragment, or explicit port; the exact
+manifest digest; the external publication-record digest; and a bounded claimed
+publication epoch. Verification checks that reference against the nested
+manifest before checking the cohort signature, runtime evidence schema and input
+bindings, exact task/report commitment, immutable key revision, and outer
+lineage signature. The full public reference is retained in the envelope while
+only its digest enters the compact outer claim. The envelope retains hashes and
+accepted aggregate evidence, not dataset payloads, prompts, model weights, or
+layer scores.
 
 This is evidence-lineage integrity, not proof of execution. It requires two
 signing operations and cannot stop a compromised signer, malicious callback, or
-unattested runtime. Publish the manifest before execution and protect the signer
+unattested runtime. The publication reference is caller supplied: this module
+does not fetch the URI, authenticate its publisher, prove the claimed time, or
+prove that the record is append-only. Publish the manifest before execution,
+validate the external record in the protected workflow, and protect the signer
 independently.
 
 ## 5. Activation patching
