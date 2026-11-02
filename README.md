@@ -344,6 +344,42 @@ and use an independently attested runner when stronger execution claims are
 required. Public provenance also does not make a selected cohort representative
 or prove causal faithfulness.
 
+Retaining the runtime record and signed cohort bundle as separate files is not
+enough: two individually valid artifacts from different runs of the same manifest
+could otherwise be paired after the fact. Use
+`create_runtime_bound_stability_evidence` to create one signed lineage envelope:
+
+```python
+from structxai.stability_lineage import (
+    create_runtime_bound_stability_evidence,
+    verify_runtime_bound_stability_evidence,
+)
+
+lineage_bundle = create_runtime_bound_stability_evidence(
+    manifest,
+    task_reports,
+    runtime_evidence,
+    signer=kms_adapter,
+)
+verification = verify_runtime_bound_stability_evidence(
+    lineage_bundle,
+    {kms_adapter.key_id: kms_adapter},
+)
+```
+
+The creator recomputes each full task-report commitment, requires the runtime
+record to commit to that exact report set, produces the existing signed cohort
+evidence, and signs a compact outer claim over both retained artifact digests.
+Verification checks the nested cohort signature, runtime evidence schema and
+input bindings, exact task/report commitment, immutable key revision, and outer
+lineage signature. The envelope retains hashes and accepted aggregate evidence,
+not dataset payloads, prompts, model weights, or layer scores.
+
+This is evidence-lineage integrity, not proof of execution. It requires two
+signing operations and cannot stop a compromised signer, malicious callback, or
+unattested runtime. Publish the manifest before execution and protect the signer
+independently.
+
 ## 5. Activation patching
 
 ```bash
@@ -483,6 +519,7 @@ structxai/
   stability_uncertainty.py task-resampled confidence intervals and policy gate
   stability_manifest.py prespecified public-task manifest and signed evidence
   stability_runtime.py manifest-locked runtime input and report commitments
+  stability_lineage.py signed cross-binding of runtime and cohort evidence
   provenance.py      fingerprints and artifact validation
   experiment.py      experiment orchestration
   report.py          standalone HTML reporting
@@ -548,4 +585,5 @@ Next research-oriented extensions include:
 ## Interview topics
 
 **logit lens · hidden states · candidate margins · sign flips · controlled interventions · activation patching · causal vs correlational explanation · explanation faithfulness · repeatability · experiment provenance · artifact validation · model hooks · reproducible research systems · FastAPI · Docker · CI.**
+
 
