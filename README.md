@@ -397,6 +397,15 @@ prove that the record is append-only. Publish the manifest before execution,
 validate the external record in the protected workflow, and protect the signer
 independently.
 
+`structxai.stability_publication` supplies that protected workflow's offline
+content-verification boundary. It creates a bounded canonical publication record and
+verifies the exact downloaded bytes, requested URI, raw response digest, claimed epoch,
+nested manifest self-digest, and full existing manifest contract before evaluation.
+Duplicate keys, reformatting, oversized responses, extra fields, and manifest
+substitution fail closed. The network client stays deployment-owned so DNS, egress,
+TLS, redirect, proxy, and authentication controls are not hidden inside research code.
+See [`docs/manifest_publication_verification.md`](docs/manifest_publication_verification.md).
+
 ## 5. Activation patching
 
 ```bash
@@ -537,6 +546,7 @@ structxai/
   stability_manifest.py prespecified public-task manifest and signed evidence
   stability_runtime.py manifest-locked runtime input and report commitments
   stability_lineage.py signed cross-binding of runtime and cohort evidence
+  stability_publication.py offline verification of externally published manifest bytes
   provenance.py      fingerprints and artifact validation
   experiment.py      experiment orchestration
   report.py          standalone HTML reporting
