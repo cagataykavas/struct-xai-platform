@@ -406,6 +406,12 @@ substitution fail closed. The network client stays deployment-owned so DNS, egre
 TLS, redirect, proxy, and authentication controls are not hidden inside research code.
 See [`docs/manifest_publication_verification.md`](docs/manifest_publication_verification.md).
 
+`structxai.stability_audit_bundle` then verifies that publication result and the signed
+runtime-lineage envelope as one retained unit. It rejects independently valid artifacts
+that disagree on the manifest, publication reference, exact record bytes, or claimed
+epoch, and emits a self-digested privacy-reduced receipt. See
+[`docs/stability_audit_bundle.md`](docs/stability_audit_bundle.md).
+
 ## 5. Activation patching
 
 ```bash
@@ -547,6 +553,7 @@ structxai/
   stability_runtime.py manifest-locked runtime input and report commitments
   stability_lineage.py signed cross-binding of runtime and cohort evidence
   stability_publication.py offline verification of externally published manifest bytes
+  stability_audit_bundle.py end-to-end publication/runtime retention receipt
   provenance.py      fingerprints and artifact validation
   experiment.py      experiment orchestration
   report.py          standalone HTML reporting
