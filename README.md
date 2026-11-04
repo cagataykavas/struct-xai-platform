@@ -412,6 +412,13 @@ that disagree on the manifest, publication reference, exact record bytes, or cla
 epoch, and emits a self-digested privacy-reduced receipt. See
 [`docs/stability_audit_bundle.md`](docs/stability_audit_bundle.md).
 
+For a production workflow, `structxai.stability_reference_custody` can require an
+independent multi-key quorum over that exact publication reference before running the
+combined audit. Every approval binds the complete custodian set and threshold, distinct
+key IDs and immutable key revisions are enforced, and the final receipt retains only
+hashed custodian metadata. See
+[`docs/publication_reference_custody.md`](docs/publication_reference_custody.md).
+
 ## 5. Activation patching
 
 ```bash
@@ -554,6 +561,7 @@ structxai/
   stability_lineage.py signed cross-binding of runtime and cohort evidence
   stability_publication.py offline verification of externally published manifest bytes
   stability_audit_bundle.py end-to-end publication/runtime retention receipt
+  stability_reference_custody.py multi-key custody quorum and cross-bound audit receipt
   provenance.py      fingerprints and artifact validation
   experiment.py      experiment orchestration
   report.py          standalone HTML reporting
