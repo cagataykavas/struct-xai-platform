@@ -26,14 +26,15 @@ from structxai.stability_manifest import (
     ExternalEvidenceVerifier,
 )
 
-PUBLICATION_REFERENCE_CUSTODY_SCHEMA = "struct-xai-publication-reference-custody/v1"
+PUBLICATION_REFERENCE_CUSTODY_SCHEMA = "struct-xai-publication-reference-custody/v2"
 PUBLICATION_REFERENCE_CUSTODY_PURPOSE = "independent-publication-reference-custody"
-PUBLICATION_REFERENCE_CUSTODY_VERIFICATION_SCHEMA = (
-    "struct-xai-publication-reference-custody-verification/v1"
-)
-CUSTODIED_STABILITY_AUDIT_RECEIPT_SCHEMA = "struct-xai-custodied-stability-audit-receipt/v1"
+PUBLICATION_REFERENCE_CUSTODY_VERIFICATION_SCHEMA = "struct-xai-publication-reference-custody-verification/v2"
+CUSTODIED_STABILITY_AUDIT_RECEIPT_SCHEMA = "struct-xai-custodied-stability-audit-receipt/v2"
 MAX_REFERENCE_CUSTODIANS = 16
 MAX_CUSTODIED_AUDIT_RECEIPT_BYTES = 8 * 1024
+MAX_CUSTODY_ATTESTATION_LIFETIME_SECONDS = 60 * 60
+MAX_CUSTODY_CLOCK_SKEW_SECONDS = 5 * 60
+MAX_CUSTODY_EPOCH = 253_402_300_799
 
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -58,6 +59,8 @@ _ATTESTATION_FIELDS = {
     "publication_reference_sha256",
     "custodian_set_sha256",
     "required_approvals",
+    "attested_at_epoch",
+    "expires_at_epoch",
     "approvals",
     "attestation_sha256",
 }
@@ -127,6 +130,12 @@ def _require_identifier(value: object, name: str) -> str:
     return value
 
 
+def _require_epoch(value: object, name: str) -> int:
+    if type(value) is not int or not 0 <= value <= MAX_CUSTODY_EPOCH:
+        raise StabilityReferenceCustodyError(f"{name} is invalid")
+    return value
+
+
 def _normalize_reference(reference: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(reference, Mapping) or set(reference) != _REFERENCE_FIELDS:
         raise StabilityReferenceCustodyError("publication reference must use the exact schema")
@@ -186,6 +195,8 @@ def _approval_claims(
     publication_reference_sha256: str,
     custodian_set_sha256: str,
     required_approvals: int,
+    attested_at_epoch: int,
+    expires_at_epoch: int,
 ) -> dict[str, object]:
     return {
         "schema_version": PUBLICATION_REFERENCE_CUSTODY_SCHEMA,
@@ -193,6 +204,8 @@ def _approval_claims(
         "publication_reference_sha256": publication_reference_sha256,
         "custodian_set_sha256": custodian_set_sha256,
         "required_approvals": required_approvals,
+        "attested_at_epoch": attested_at_epoch,
+        "expires_at_epoch": expires_at_epoch,
         **{field: approval[field] for field in _APPROVAL_METADATA_FIELDS},
     }
 
@@ -211,9 +224,7 @@ def _validate_approval_metadata(approval: Mapping[str, object]) -> dict[str, str
         "algorithm": algorithm,
         "signature_encoding": EXTERNAL_SIGNATURE_ENCODING,
         "key_id": _require_identifier(approval.get("key_id"), "key_id"),
-        "key_revision_sha256": _require_digest(
-            approval.get("key_revision_sha256"), "key_revision_sha256"
-        ),
+        "key_revision_sha256": _require_digest(approval.get("key_revision_sha256"), "key_revision_sha256"),
     }
 
 
@@ -222,8 +233,10 @@ def create_publication_reference_custody_attestation(
     custodians: Mapping[str, ExternalEvidenceSigner],
     *,
     required_approvals: int = 2,
+    attested_at_epoch: int,
+    expires_at_epoch: int,
 ) -> dict[str, object]:
-    """Create a quorum attestation over one exact publication reference."""
+    """Create a short-lived quorum attestation over one exact publication reference."""
 
     reference = _normalize_reference(publication_reference)
     if not isinstance(custodians, Mapping) or not 2 <= len(custodians) <= MAX_REFERENCE_CUSTODIANS:
@@ -234,6 +247,13 @@ def create_publication_reference_custody_attestation(
         or not 2 <= required_approvals <= len(custodians)
     ):
         raise StabilityReferenceCustodyError("required_approvals is invalid")
+    attested_at = _require_epoch(attested_at_epoch, "attested_at_epoch")
+    expires_at = _require_epoch(expires_at_epoch, "expires_at_epoch")
+    if (
+        attested_at < int(reference["published_at_epoch"])
+        or not attested_at < expires_at <= attested_at + MAX_CUSTODY_ATTESTATION_LIFETIME_SECONDS
+    ):
+        raise StabilityReferenceCustodyError("custody attestation validity window is invalid")
 
     signer_by_custodian: dict[str, ExternalEvidenceSigner] = {}
     metadata: list[dict[str, str]] = []
@@ -269,6 +289,8 @@ def create_publication_reference_custody_attestation(
             publication_reference_sha256=reference_sha256,
             custodian_set_sha256=custodian_set_sha256,
             required_approvals=required_approvals,
+            attested_at_epoch=attested_at,
+            expires_at_epoch=expires_at,
         )
         try:
             signature = signer_by_custodian[item["custodian_id"]].sign(_canonical_json(claims))
@@ -282,6 +304,8 @@ def create_publication_reference_custody_attestation(
         "publication_reference_sha256": reference_sha256,
         "custodian_set_sha256": custodian_set_sha256,
         "required_approvals": required_approvals,
+        "attested_at_epoch": attested_at,
+        "expires_at_epoch": expires_at,
         "approvals": approvals,
     }
     attestation["attestation_sha256"] = _digest(attestation)
@@ -292,8 +316,11 @@ def verify_publication_reference_custody_attestation(
     publication_reference: Mapping[str, object],
     attestation: Mapping[str, object],
     verifiers: Mapping[str, ExternalEvidenceVerifier],
+    *,
+    verification_epoch: int,
+    clock_skew_seconds: int = MAX_CUSTODY_CLOCK_SKEW_SECONDS,
 ) -> dict[str, object]:
-    """Require a valid threshold of independently configured custody keys."""
+    """Require a fresh threshold of independently configured custody keys."""
 
     reference = _normalize_reference(publication_reference)
     if not isinstance(attestation, Mapping) or set(attestation) != _ATTESTATION_FIELDS:
@@ -315,6 +342,20 @@ def verify_publication_reference_custody_attestation(
         raise StabilityReferenceCustodyError("custody approval threshold is invalid")
     if not isinstance(verifiers, Mapping):
         raise StabilityReferenceCustodyError("verifiers must be a mapping")
+    attested_at = _require_epoch(document.get("attested_at_epoch"), "attested_at_epoch")
+    expires_at = _require_epoch(document.get("expires_at_epoch"), "expires_at_epoch")
+    verified_at = _require_epoch(verification_epoch, "verification_epoch")
+    if type(clock_skew_seconds) is not int or not 0 <= clock_skew_seconds <= MAX_CUSTODY_CLOCK_SKEW_SECONDS:
+        raise StabilityReferenceCustodyError("clock_skew_seconds is invalid")
+    if (
+        attested_at < int(reference["published_at_epoch"])
+        or not attested_at < expires_at <= attested_at + MAX_CUSTODY_ATTESTATION_LIFETIME_SECONDS
+    ):
+        raise StabilityReferenceCustodyError("custody attestation validity window is invalid")
+    if verified_at < attested_at - clock_skew_seconds:
+        raise StabilityReferenceCustodyError("custody attestation is from the future")
+    if verified_at > expires_at:
+        raise StabilityReferenceCustodyError("custody attestation has expired")
 
     normalized_metadata: list[dict[str, str]] = []
     for approval in approvals:
@@ -358,6 +399,8 @@ def verify_publication_reference_custody_attestation(
             publication_reference_sha256=reference_sha256,
             custodian_set_sha256=custodian_set_sha256,
             required_approvals=required,
+            attested_at_epoch=attested_at,
+            expires_at_epoch=expires_at,
         )
         try:
             verified = verifier.verify(
@@ -379,6 +422,10 @@ def verify_publication_reference_custody_attestation(
         "attestation_sha256": claimed_attestation_sha256,
         "required_approvals": required,
         "valid_approvals": len(valid_revisions),
+        "attested_at_epoch": attested_at,
+        "expires_at_epoch": expires_at,
+        "verified_at_epoch": verified_at,
+        "clock_skew_seconds": clock_skew_seconds,
         "valid_key_revisions_sha256": _digest(sorted(valid_revisions)),
     }
     verification["verification_sha256"] = _digest(verification)
@@ -394,6 +441,8 @@ def verify_custodied_stability_audit_bundle(
     lineage_bundle: Mapping[str, object],
     custody_verifiers: Mapping[str, ExternalEvidenceVerifier],
     lineage_verifiers: Mapping[str, ExternalEvidenceVerifier],
+    verification_epoch: int,
+    clock_skew_seconds: int = MAX_CUSTODY_CLOCK_SKEW_SECONDS,
 ) -> dict[str, object]:
     """Verify reference custody, publication bytes, and signed runtime lineage as one unit."""
 
@@ -402,6 +451,8 @@ def verify_custodied_stability_audit_bundle(
             publication_reference,
             custody_attestation,
             custody_verifiers,
+            verification_epoch=verification_epoch,
+            clock_skew_seconds=clock_skew_seconds,
         )
     except (StabilityReferenceCustodyError, TypeError, ValueError) as exc:
         raise StabilityReferenceCustodyError("reference custody verification failed") from exc

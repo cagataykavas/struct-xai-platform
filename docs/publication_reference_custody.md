@@ -24,6 +24,8 @@ custody_attestation = create_publication_reference_custody_attestation(
         "external-auditor": auditor_signer,
     },
     required_approvals=2,
+    attested_at_epoch=trusted_now_epoch,
+    expires_at_epoch=trusted_now_epoch + 600,
 )
 ```
 
@@ -32,7 +34,8 @@ ordered canonically, and every signature binds:
 
 - the exact publication-reference SHA-256;
 - the digest of the complete ordered custodian set;
-- the required approval count; and
+- the required approval count;
+- the issuance and expiry epochs; and
 - that approval's custodian ID, algorithm, key ID, key revision, and encoding.
 
 This prevents an intermediary from lowering the threshold or swapping, adding, or
@@ -59,6 +62,7 @@ receipt = verify_custodied_stability_audit_bundle(
     lineage_bundle=runtime_bound_signed_evidence,
     custody_verifiers=trusted_custody_public_keys,
     lineage_verifiers=trusted_lineage_public_keys,
+    verification_epoch=trusted_now_epoch,
 )
 receipt_bytes = serialize_custodied_stability_audit_receipt(receipt)
 ```
@@ -68,6 +72,13 @@ approvals remain. Malformed schemas, duplicate custodian identities, reused key 
 key revisions, reference substitution, threshold changes, and insufficient valid keys
 fail closed. Provider errors are converted to stable boundary errors without copying
 private diagnostics.
+
+Attestations must be issued at or after the publication epoch and expire within one
+hour. Verification rejects expired attestations and attestations dated more than five
+minutes in the future. The verifier requires an explicit epoch instead of reading the
+host clock implicitly, so a protected runner can supply time from its approved source.
+The signed window and applied verification time/skew are committed into the verification
+digest; changing the window invalidates every custodian approval.
 
 The final receipt contains only evidence digests and approval counts. It does not copy
 the public URI, custodian/key identifiers, signatures, prompts, task IDs, records,
@@ -80,6 +91,6 @@ This is multi-key authorization of a reference, not proof that the custodians ar
 organizationally independent. A deployment must provision keys under genuinely
 separate control planes, distribute trusted public keys out of band, and define key
 rotation and revocation policy. The module does not fetch records or keys, authenticate
-the publication service, establish trusted time, provide transparency-log consistency,
-prove immutable storage, or attest model execution. Those controls remain with the
-protected runner and evidence-retention system.
+the publication service, establish trusted time, authenticate the supplied verification
+epoch, provide transparency-log consistency, prove immutable storage, or attest model
+execution. Those controls remain with the protected runner and evidence-retention system.

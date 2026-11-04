@@ -415,7 +415,9 @@ epoch, and emits a self-digested privacy-reduced receipt. See
 For a production workflow, `structxai.stability_reference_custody` can require an
 independent multi-key quorum over that exact publication reference before running the
 combined audit. Every approval binds the complete custodian set and threshold, distinct
-key IDs and immutable key revisions are enforced, and the final receipt retains only
+key IDs and immutable key revisions are enforced, and a signed one-hour maximum validity
+window prevents stale quorum evidence from being replayed indefinitely. The protected
+verifier supplies the current epoch explicitly, while the final receipt retains only
 hashed custodian metadata. See
 [`docs/publication_reference_custody.md`](docs/publication_reference_custody.md).
 
