@@ -29,7 +29,13 @@ from structxai.stability_manifest import (
 PUBLICATION_REFERENCE_CUSTODY_SCHEMA = "struct-xai-publication-reference-custody/v2"
 PUBLICATION_REFERENCE_CUSTODY_PURPOSE = "independent-publication-reference-custody"
 PUBLICATION_REFERENCE_CUSTODY_VERIFICATION_SCHEMA = "struct-xai-publication-reference-custody-verification/v2"
+PUBLICATION_REFERENCE_CUSTODY_REVOCATION_VERIFICATION_SCHEMA = (
+    "struct-xai-publication-reference-custody-revocation-verification/v1"
+)
 CUSTODIED_STABILITY_AUDIT_RECEIPT_SCHEMA = "struct-xai-custodied-stability-audit-receipt/v2"
+CUSTODY_KEY_STATUS_SNAPSHOT_SCHEMA = "struct-xai-custody-key-status-snapshot/v1"
+CUSTODY_KEY_STATUS_VERIFICATION_SCHEMA = "struct-xai-custody-key-status-verification/v1"
+CUSTODY_KEY_STATUS_PURPOSE = "publication-reference-custodian-key-status"
 MAX_REFERENCE_CUSTODIANS = 16
 MAX_CUSTODIED_AUDIT_RECEIPT_BYTES = 8 * 1024
 MAX_CUSTODY_ATTESTATION_LIFETIME_SECONDS = 60 * 60
@@ -85,6 +91,21 @@ _RECEIPT_DIGEST_FIELDS = _RECEIPT_FIELDS - {
     "reference_required_approvals",
     "reference_valid_approvals",
 }
+_KEY_STATUS_ROW_FIELDS = {"key_id", "key_revision_sha256", "status"}
+_KEY_STATUS_SNAPSHOT_FIELDS = {
+    "schema_version",
+    "purpose",
+    "issued_at_epoch",
+    "expires_at_epoch",
+    "authority_algorithm",
+    "authority_key_id",
+    "authority_key_revision_sha256",
+    "signature_encoding",
+    "statuses",
+    "snapshot_sha256",
+    "signature",
+}
+_KEY_STATUS_VALUES = {"active", "revoked"}
 
 
 class StabilityReferenceCustodyError(ValueError):
@@ -226,6 +247,205 @@ def _validate_approval_metadata(approval: Mapping[str, object]) -> dict[str, str
         "key_id": _require_identifier(approval.get("key_id"), "key_id"),
         "key_revision_sha256": _require_digest(approval.get("key_revision_sha256"), "key_revision_sha256"),
     }
+
+
+def _key_status_claims(snapshot: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: snapshot[key]
+        for key in _KEY_STATUS_SNAPSHOT_FIELDS
+        if key not in {"signature", "snapshot_sha256"}
+    }
+
+
+def _normalize_key_status_rows(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not 2 <= len(value) <= MAX_REFERENCE_CUSTODIANS:
+        raise StabilityReferenceCustodyError("key status rows are invalid")
+    rows: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != _KEY_STATUS_ROW_FIELDS:
+            raise StabilityReferenceCustodyError("key status row must use the exact schema")
+        status = item.get("status")
+        if not isinstance(status, str) or status not in _KEY_STATUS_VALUES:
+            raise StabilityReferenceCustodyError("custodian key status is invalid")
+        rows.append(
+            {
+                "key_id": _require_identifier(item.get("key_id"), "key_id"),
+                "key_revision_sha256": _require_digest(
+                    item.get("key_revision_sha256"), "key_revision_sha256"
+                ),
+                "status": str(status),
+            }
+        )
+    if rows != sorted(rows, key=lambda item: item["key_id"]):
+        raise StabilityReferenceCustodyError("key status rows are not canonically ordered")
+    if len({item["key_id"] for item in rows}) != len(rows):
+        raise StabilityReferenceCustodyError("key status identifiers must be distinct")
+    if len({item["key_revision_sha256"] for item in rows}) != len(rows):
+        raise StabilityReferenceCustodyError("key status revisions must be distinct")
+    return rows
+
+
+def create_custody_key_status_snapshot(
+    key_statuses: Mapping[str, tuple[str, str]],
+    authority: ExternalEvidenceSigner,
+    *,
+    issued_at_epoch: int,
+    expires_at_epoch: int,
+) -> dict[str, object]:
+    """Sign one short-lived active/revoked view of the exact custodian key set."""
+
+    if not isinstance(key_statuses, Mapping) or not 2 <= len(key_statuses) <= MAX_REFERENCE_CUSTODIANS:
+        raise StabilityReferenceCustodyError("key_statuses must contain from 2 through 16 keys")
+    issued_at = _require_epoch(issued_at_epoch, "issued_at_epoch")
+    expires_at = _require_epoch(expires_at_epoch, "expires_at_epoch")
+    if not issued_at < expires_at <= issued_at + MAX_CUSTODY_ATTESTATION_LIFETIME_SECONDS:
+        raise StabilityReferenceCustodyError("key status validity window is invalid")
+    rows: list[dict[str, str]] = []
+    for raw_key_id, value in key_statuses.items():
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise StabilityReferenceCustodyError("custodian key status is invalid")
+        revision, status = value
+        if not isinstance(status, str) or status not in _KEY_STATUS_VALUES:
+            raise StabilityReferenceCustodyError("custodian key status is invalid")
+        rows.append(
+            {
+                "key_id": _require_identifier(raw_key_id, "key_id"),
+                "key_revision_sha256": _require_digest(revision, "key_revision_sha256"),
+                "status": status,
+            }
+        )
+    rows.sort(key=lambda item: item["key_id"])
+    rows = _normalize_key_status_rows(rows)
+    algorithm, authority_key_id, authority_revision = _adapter_metadata(authority)
+    if not callable(getattr(authority, "sign", None)):
+        raise StabilityReferenceCustodyError("key status authority signer is invalid")
+    if authority_revision in {item["key_revision_sha256"] for item in rows}:
+        raise StabilityReferenceCustodyError("key status authority must be independent")
+    claims: dict[str, object] = {
+        "schema_version": CUSTODY_KEY_STATUS_SNAPSHOT_SCHEMA,
+        "purpose": CUSTODY_KEY_STATUS_PURPOSE,
+        "issued_at_epoch": issued_at,
+        "expires_at_epoch": expires_at,
+        "authority_algorithm": algorithm,
+        "authority_key_id": authority_key_id,
+        "authority_key_revision_sha256": authority_revision,
+        "signature_encoding": EXTERNAL_SIGNATURE_ENCODING,
+        "statuses": rows,
+    }
+    snapshot_sha256 = _digest(claims)
+    try:
+        signature = authority.sign(_canonical_json({**claims, "snapshot_sha256": snapshot_sha256}))
+    except Exception as exc:
+        raise StabilityReferenceCustodyError("key status signing failed") from exc
+    return {
+        **claims,
+        "snapshot_sha256": snapshot_sha256,
+        "signature": _encode_signature(signature),
+    }
+
+
+def _verify_custody_key_status_snapshot(
+    snapshot: Mapping[str, object],
+    expected_keys: Mapping[str, str],
+    authority_verifiers: Mapping[str, ExternalEvidenceVerifier],
+    *,
+    verification_epoch: int,
+    clock_skew_seconds: int,
+) -> tuple[dict[str, object], frozenset[str]]:
+    if not isinstance(snapshot, Mapping) or set(snapshot) != _KEY_STATUS_SNAPSHOT_FIELDS:
+        raise StabilityReferenceCustodyError("key status snapshot must use the exact schema")
+    document = dict(snapshot)
+    if (
+        document.get("schema_version") != CUSTODY_KEY_STATUS_SNAPSHOT_SCHEMA
+        or document.get("purpose") != CUSTODY_KEY_STATUS_PURPOSE
+        or document.get("signature_encoding") != EXTERNAL_SIGNATURE_ENCODING
+    ):
+        raise StabilityReferenceCustodyError("key status snapshot metadata is invalid")
+    issued_at = _require_epoch(document.get("issued_at_epoch"), "issued_at_epoch")
+    expires_at = _require_epoch(document.get("expires_at_epoch"), "expires_at_epoch")
+    verified_at = _require_epoch(verification_epoch, "verification_epoch")
+    if type(clock_skew_seconds) is not int or not 0 <= clock_skew_seconds <= MAX_CUSTODY_CLOCK_SKEW_SECONDS:
+        raise StabilityReferenceCustodyError("clock_skew_seconds is invalid")
+    if not issued_at < expires_at <= issued_at + MAX_CUSTODY_ATTESTATION_LIFETIME_SECONDS:
+        raise StabilityReferenceCustodyError("key status validity window is invalid")
+    if verified_at < issued_at - clock_skew_seconds:
+        raise StabilityReferenceCustodyError("key status snapshot is from the future")
+    if verified_at > expires_at:
+        raise StabilityReferenceCustodyError("key status snapshot has expired")
+    rows = _normalize_key_status_rows(document.get("statuses"))
+    if not isinstance(expected_keys, Mapping) or not 2 <= len(expected_keys) <= MAX_REFERENCE_CUSTODIANS:
+        raise StabilityReferenceCustodyError("expected custodian keys are invalid")
+    normalized_expected = {
+        _require_identifier(key_id, "key_id"): _require_digest(revision, "key_revision_sha256")
+        for key_id, revision in expected_keys.items()
+    }
+    observed = {item["key_id"]: item["key_revision_sha256"] for item in rows}
+    if observed != normalized_expected:
+        raise StabilityReferenceCustodyError("key status snapshot does not cover the custodian set")
+    authority_metadata = (
+        _require_identifier(document.get("authority_algorithm"), "authority_algorithm"),
+        _require_identifier(document.get("authority_key_id"), "authority_key_id"),
+        _require_digest(document.get("authority_key_revision_sha256"), "authority_key_revision_sha256"),
+    )
+    if authority_metadata[0] not in EXTERNAL_SIGNATURE_ALGORITHMS:
+        raise StabilityReferenceCustodyError("key status authority algorithm is unsupported")
+    if authority_metadata[2] in set(observed.values()):
+        raise StabilityReferenceCustodyError("key status authority must be independent")
+    claimed_snapshot_sha256 = document.get("snapshot_sha256")
+    if not _same(claimed_snapshot_sha256, _digest(_key_status_claims(document))):
+        raise StabilityReferenceCustodyError("key status snapshot digest does not match its content")
+    if not isinstance(authority_verifiers, Mapping):
+        raise StabilityReferenceCustodyError("key status authority verifiers must be a mapping")
+    verifier = authority_verifiers.get(authority_metadata[1])
+    if verifier is None:
+        raise StabilityReferenceCustodyError("key status authority is unavailable")
+    try:
+        verifier_metadata = _adapter_metadata(verifier)
+    except StabilityReferenceCustodyError as exc:
+        raise StabilityReferenceCustodyError("key status authority metadata is invalid") from exc
+    if verifier_metadata != authority_metadata or not callable(getattr(verifier, "verify", None)):
+        raise StabilityReferenceCustodyError("key status authority metadata mismatch")
+    try:
+        verified = verifier.verify(
+            _canonical_json({**_key_status_claims(document), "snapshot_sha256": claimed_snapshot_sha256}),
+            _decode_signature(document.get("signature")),
+        )
+    except Exception:  # noqa: BLE001 - provider failures are stable verification failures
+        verified = False
+    if verified is not True:
+        raise StabilityReferenceCustodyError("key status signature is invalid")
+    active_revisions = frozenset(item["key_revision_sha256"] for item in rows if item["status"] == "active")
+    verification: dict[str, object] = {
+        "schema_version": CUSTODY_KEY_STATUS_VERIFICATION_SCHEMA,
+        "verified": True,
+        "snapshot_sha256": claimed_snapshot_sha256,
+        "verified_at_epoch": verified_at,
+        "active_key_count": len(active_revisions),
+        "revoked_key_count": len(rows) - len(active_revisions),
+        "active_key_revisions_sha256": _digest(sorted(active_revisions)),
+    }
+    verification["verification_sha256"] = _digest(verification)
+    return verification, active_revisions
+
+
+def verify_custody_key_status_snapshot(
+    snapshot: Mapping[str, object],
+    expected_keys: Mapping[str, str],
+    authority_verifiers: Mapping[str, ExternalEvidenceVerifier],
+    *,
+    verification_epoch: int,
+    clock_skew_seconds: int = MAX_CUSTODY_CLOCK_SKEW_SECONDS,
+) -> dict[str, object]:
+    """Verify one exact short-lived custodian key-status view."""
+
+    verification, _ = _verify_custody_key_status_snapshot(
+        snapshot,
+        expected_keys,
+        authority_verifiers,
+        verification_epoch=verification_epoch,
+        clock_skew_seconds=clock_skew_seconds,
+    )
+    return verification
 
 
 def create_publication_reference_custody_attestation(
@@ -432,6 +652,66 @@ def verify_publication_reference_custody_attestation(
     return verification
 
 
+def verify_publication_reference_custody_with_key_status(
+    publication_reference: Mapping[str, object],
+    attestation: Mapping[str, object],
+    verifiers: Mapping[str, ExternalEvidenceVerifier],
+    key_status_snapshot: Mapping[str, object],
+    key_status_authority_verifiers: Mapping[str, ExternalEvidenceVerifier],
+    *,
+    verification_epoch: int,
+    clock_skew_seconds: int = MAX_CUSTODY_CLOCK_SKEW_SECONDS,
+) -> dict[str, object]:
+    """Exclude revoked custodian revisions before calculating the custody quorum."""
+
+    if not isinstance(attestation, Mapping) or set(attestation) != _ATTESTATION_FIELDS:
+        raise StabilityReferenceCustodyError("custody attestation must use the exact schema")
+    approvals = attestation.get("approvals")
+    if not isinstance(approvals, list):
+        raise StabilityReferenceCustodyError("custody approval threshold is invalid")
+    if not isinstance(verifiers, Mapping):
+        raise StabilityReferenceCustodyError("verifiers must be a mapping")
+    metadata = [_validate_approval_metadata(approval) for approval in approvals]
+    expected_keys = {item["key_id"]: item["key_revision_sha256"] for item in metadata}
+    key_status, active_revisions = _verify_custody_key_status_snapshot(
+        key_status_snapshot,
+        expected_keys,
+        key_status_authority_verifiers,
+        verification_epoch=verification_epoch,
+        clock_skew_seconds=clock_skew_seconds,
+    )
+    active_verifiers: dict[str, ExternalEvidenceVerifier] = {}
+    for key_id, verifier in verifiers.items():
+        try:
+            _algorithm, verifier_key_id, revision = _adapter_metadata(verifier)
+        except StabilityReferenceCustodyError:
+            continue
+        if key_id == verifier_key_id and revision in active_revisions:
+            active_verifiers[key_id] = verifier
+    custody = verify_publication_reference_custody_attestation(
+        publication_reference,
+        attestation,
+        active_verifiers,
+        verification_epoch=verification_epoch,
+        clock_skew_seconds=clock_skew_seconds,
+    )
+    verification: dict[str, object] = {
+        key: value for key, value in custody.items() if key not in {"schema_version", "verification_sha256"}
+    }
+    verification.update(
+        {
+            "schema_version": PUBLICATION_REFERENCE_CUSTODY_REVOCATION_VERIFICATION_SCHEMA,
+            "base_custody_verification_sha256": custody["verification_sha256"],
+            "key_status_snapshot_sha256": key_status["snapshot_sha256"],
+            "key_status_verification_sha256": key_status["verification_sha256"],
+            "active_key_count": key_status["active_key_count"],
+            "revoked_key_count": key_status["revoked_key_count"],
+        }
+    )
+    verification["verification_sha256"] = _digest(verification)
+    return verification
+
+
 def verify_custodied_stability_audit_bundle(
     publication_reference: Mapping[str, object],
     custody_attestation: Mapping[str, object],
@@ -443,17 +723,32 @@ def verify_custodied_stability_audit_bundle(
     lineage_verifiers: Mapping[str, ExternalEvidenceVerifier],
     verification_epoch: int,
     clock_skew_seconds: int = MAX_CUSTODY_CLOCK_SKEW_SECONDS,
+    key_status_snapshot: Mapping[str, object] | None = None,
+    key_status_authority_verifiers: Mapping[str, ExternalEvidenceVerifier] | None = None,
 ) -> dict[str, object]:
     """Verify reference custody, publication bytes, and signed runtime lineage as one unit."""
 
     try:
-        custody = verify_publication_reference_custody_attestation(
-            publication_reference,
-            custody_attestation,
-            custody_verifiers,
-            verification_epoch=verification_epoch,
-            clock_skew_seconds=clock_skew_seconds,
-        )
+        if key_status_snapshot is None and key_status_authority_verifiers is None:
+            custody = verify_publication_reference_custody_attestation(
+                publication_reference,
+                custody_attestation,
+                custody_verifiers,
+                verification_epoch=verification_epoch,
+                clock_skew_seconds=clock_skew_seconds,
+            )
+        elif key_status_snapshot is not None and key_status_authority_verifiers is not None:
+            custody = verify_publication_reference_custody_with_key_status(
+                publication_reference,
+                custody_attestation,
+                custody_verifiers,
+                key_status_snapshot,
+                key_status_authority_verifiers,
+                verification_epoch=verification_epoch,
+                clock_skew_seconds=clock_skew_seconds,
+            )
+        else:
+            raise StabilityReferenceCustodyError("key status inputs must be supplied together")
     except (StabilityReferenceCustodyError, TypeError, ValueError) as exc:
         raise StabilityReferenceCustodyError("reference custody verification failed") from exc
     try:

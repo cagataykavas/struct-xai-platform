@@ -9,13 +9,17 @@ import pytest
 from structxai.stability_lineage import create_manifest_publication_reference
 from structxai.stability_reference_custody import (
     CUSTODIED_STABILITY_AUDIT_RECEIPT_SCHEMA,
+    CUSTODY_KEY_STATUS_SNAPSHOT_SCHEMA,
     MAX_CUSTODY_ATTESTATION_LIFETIME_SECONDS,
     PUBLICATION_REFERENCE_CUSTODY_SCHEMA,
     StabilityReferenceCustodyError,
+    create_custody_key_status_snapshot,
     create_publication_reference_custody_attestation,
     serialize_custodied_stability_audit_receipt,
     verify_custodied_stability_audit_bundle,
+    verify_custody_key_status_snapshot,
     verify_publication_reference_custody_attestation,
+    verify_publication_reference_custody_with_key_status,
 )
 from tests.test_stability_audit_bundle import PUBLICATION_URI, PUBLISHED_AT, _audit_fixture
 
@@ -76,6 +80,30 @@ def _attest(
         attested_at_epoch=ATTESTED_AT,
         expires_at_epoch=EXPIRES_AT,
     )
+
+
+def _key_status_snapshot(
+    custodians: dict[str, _CustodianAdapter],
+    *,
+    statuses: dict[str, str] | None = None,
+    issued_at_epoch: int = ATTESTED_AT,
+    expires_at_epoch: int = EXPIRES_AT,
+) -> tuple[dict[str, object], _CustodianAdapter]:
+    authority = _CustodianAdapter("key-status-authority")
+    values = statuses or {}
+    snapshot = create_custody_key_status_snapshot(
+        {
+            adapter.key_id: (
+                adapter.key_revision_sha256,
+                values.get(adapter.key_id, "active"),
+            )
+            for adapter in custodians.values()
+        },
+        authority,
+        issued_at_epoch=issued_at_epoch,
+        expires_at_epoch=expires_at_epoch,
+    )
+    return snapshot, authority
 
 
 def test_custodied_audit_is_deterministic_cross_bound_and_privacy_reduced(tmp_path) -> None:
@@ -324,3 +352,172 @@ def test_attestation_and_receipt_reject_schema_extension_and_tampering(tmp_path)
         )
     with pytest.raises(StabilityReferenceCustodyError, match="exact schema"):
         serialize_custodied_stability_audit_receipt({**receipt, "unreviewed": True})
+
+
+def test_key_status_snapshot_filters_revoked_revisions_before_quorum(tmp_path) -> None:
+    _manifest, _record, reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
+    custodians = _custodians()
+    attestation = _attest(reference, custodians)
+    revoked_key_id = custodians["custodian-3"].key_id
+    snapshot, authority = _key_status_snapshot(
+        custodians,
+        statuses={revoked_key_id: "revoked"},
+    )
+
+    verification = verify_publication_reference_custody_with_key_status(
+        reference,
+        attestation,
+        _verifiers(custodians),
+        snapshot,
+        {authority.key_id: authority},
+        verification_epoch=VERIFICATION_EPOCH,
+    )
+
+    assert snapshot["schema_version"] == CUSTODY_KEY_STATUS_SNAPSHOT_SCHEMA
+    assert verification["valid_approvals"] == 2
+    assert verification["active_key_count"] == 2
+    assert verification["revoked_key_count"] == 1
+    assert len(str(verification["key_status_verification_sha256"])) == 64
+
+
+def test_revoked_quorum_cannot_verify_even_with_valid_custody_signatures(tmp_path) -> None:
+    _manifest, _record, reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
+    custodians = _custodians()
+    attestation = _attest(reference, custodians)
+    snapshot, authority = _key_status_snapshot(
+        custodians,
+        statuses={
+            custodians["custodian-2"].key_id: "revoked",
+            custodians["custodian-3"].key_id: "revoked",
+        },
+    )
+
+    with pytest.raises(StabilityReferenceCustodyError, match="quorum is not satisfied"):
+        verify_publication_reference_custody_with_key_status(
+            reference,
+            attestation,
+            _verifiers(custodians),
+            snapshot,
+            {authority.key_id: authority},
+            verification_epoch=VERIFICATION_EPOCH,
+        )
+
+
+def test_key_status_snapshot_rejects_tampering_coverage_and_authority_substitution(tmp_path) -> None:
+    _manifest, _record, _reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
+    custodians = _custodians()
+    snapshot, authority = _key_status_snapshot(custodians)
+    tampered = copy.deepcopy(snapshot)
+    tampered["statuses"][0]["status"] = "revoked"
+    missing = copy.deepcopy(snapshot)
+    missing["statuses"].pop()
+    missing["snapshot_sha256"] = _digest(
+        {key: value for key, value in missing.items() if key not in {"snapshot_sha256", "signature"}}
+    )
+    wrong_authority = _CustodianAdapter("wrong-key-status-authority")
+    expected_keys = {adapter.key_id: adapter.key_revision_sha256 for adapter in custodians.values()}
+
+    with pytest.raises(StabilityReferenceCustodyError, match="digest does not match"):
+        verify_custody_key_status_snapshot(
+            tampered,
+            expected_keys,
+            {authority.key_id: authority},
+            verification_epoch=VERIFICATION_EPOCH,
+        )
+    with pytest.raises(StabilityReferenceCustodyError, match="does not cover"):
+        verify_custody_key_status_snapshot(
+            missing,
+            expected_keys,
+            {authority.key_id: authority},
+            verification_epoch=VERIFICATION_EPOCH,
+        )
+    with pytest.raises(StabilityReferenceCustodyError, match="unavailable"):
+        verify_custody_key_status_snapshot(
+            snapshot,
+            expected_keys,
+            {wrong_authority.key_id: wrong_authority},
+            verification_epoch=VERIFICATION_EPOCH,
+        )
+
+
+@pytest.mark.parametrize(
+    ("issued_at_epoch", "expires_at_epoch", "verification_epoch", "message"),
+    [
+        (ATTESTED_AT, EXPIRES_AT, EXPIRES_AT + 1, "has expired"),
+        (ATTESTED_AT, EXPIRES_AT, ATTESTED_AT - 301, "from the future"),
+        (
+            ATTESTED_AT,
+            ATTESTED_AT + MAX_CUSTODY_ATTESTATION_LIFETIME_SECONDS + 1,
+            VERIFICATION_EPOCH,
+            "validity window",
+        ),
+    ],
+)
+def test_key_status_snapshot_enforces_freshness(
+    tmp_path,
+    issued_at_epoch,
+    expires_at_epoch,
+    verification_epoch,
+    message,
+) -> None:
+    _manifest, _record, _reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
+    custodians = _custodians()
+    expected_keys = {adapter.key_id: adapter.key_revision_sha256 for adapter in custodians.values()}
+    if expires_at_epoch > issued_at_epoch + MAX_CUSTODY_ATTESTATION_LIFETIME_SECONDS:
+        with pytest.raises(StabilityReferenceCustodyError, match=message):
+            _key_status_snapshot(
+                custodians,
+                issued_at_epoch=issued_at_epoch,
+                expires_at_epoch=expires_at_epoch,
+            )
+        return
+    snapshot, authority = _key_status_snapshot(
+        custodians,
+        issued_at_epoch=issued_at_epoch,
+        expires_at_epoch=expires_at_epoch,
+    )
+    with pytest.raises(StabilityReferenceCustodyError, match=message):
+        verify_custody_key_status_snapshot(
+            snapshot,
+            expected_keys,
+            {authority.key_id: authority},
+            verification_epoch=verification_epoch,
+        )
+
+
+def test_key_status_authority_must_be_independent_from_custodian_keys(tmp_path) -> None:
+    _manifest, _record, _reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
+    custodians = _custodians()
+    authority = custodians["custodian-1"]
+
+    with pytest.raises(StabilityReferenceCustodyError, match="must be independent"):
+        create_custody_key_status_snapshot(
+            {adapter.key_id: (adapter.key_revision_sha256, "active") for adapter in custodians.values()},
+            authority,
+            issued_at_epoch=ATTESTED_AT,
+            expires_at_epoch=EXPIRES_AT,
+        )
+
+
+def test_custodied_audit_can_cross_bind_key_status_verification(tmp_path) -> None:
+    _manifest, record, reference, lineage, lineage_adapter = _audit_fixture(tmp_path)
+    custodians = _custodians()
+    attestation = _attest(reference, custodians)
+    snapshot, authority = _key_status_snapshot(custodians)
+
+    receipt = verify_custodied_stability_audit_bundle(
+        reference,
+        attestation,
+        record,
+        retrieved_uri=PUBLICATION_URI,
+        lineage_bundle=lineage,
+        custody_verifiers=_verifiers(custodians),
+        lineage_verifiers={lineage_adapter.key_id: lineage_adapter},
+        verification_epoch=VERIFICATION_EPOCH,
+        key_status_snapshot=snapshot,
+        key_status_authority_verifiers={authority.key_id: authority},
+    )
+
+    assert receipt["verified"] is True
+    assert receipt["reference_valid_approvals"] == 3
+    assert len(str(receipt["reference_custody_verification_sha256"])) == 64

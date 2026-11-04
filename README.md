@@ -416,9 +416,11 @@ For a production workflow, `structxai.stability_reference_custody` can require a
 independent multi-key quorum over that exact publication reference before running the
 combined audit. Every approval binds the complete custodian set and threshold, distinct
 key IDs and immutable key revisions are enforced, and a signed one-hour maximum validity
-window prevents stale quorum evidence from being replayed indefinitely. The protected
-verifier supplies the current epoch explicitly, while the final receipt retains only
-hashed custodian metadata. See
+window prevents stale quorum evidence from being replayed indefinitely. A separately signed,
+short-lived key-status snapshot can remove revoked revisions before quorum calculation while
+requiring exact key-set coverage and a distinct status-authority key. The protected verifier
+supplies the current epoch explicitly, while the final receipt retains only hashed custodian
+metadata. See
 [`docs/publication_reference_custody.md`](docs/publication_reference_custody.md).
 
 ## 5. Activation patching
