@@ -63,6 +63,8 @@ receipt = verify_custodied_stability_audit_bundle(
     custody_verifiers=trusted_custody_public_keys,
     lineage_verifiers=trusted_lineage_public_keys,
     verification_epoch=trusted_now_epoch,
+    key_status_snapshot=signed_custodian_key_status,
+    key_status_authority_verifiers=trusted_key_status_authorities,
 )
 receipt_bytes = serialize_custodied_stability_audit_receipt(receipt)
 ```
@@ -80,6 +82,35 @@ host clock implicitly, so a protected runner can supply time from its approved s
 The signed window and applied verification time/skew are committed into the verification
 digest; changing the window invalidates every custodian approval.
 
+## Enforce custodian key revocation
+
+`create_custody_key_status_snapshot` produces a separately signed, short-lived view of the exact
+custodian key set. Every row binds a key ID and immutable key-revision digest to either `active` or
+`revoked`. The snapshot must cover the attestation's complete key set exactly, expire within one
+hour, and be signed by an authority key whose revision is distinct from every custodian revision.
+
+```python
+from structxai.stability_reference_custody import create_custody_key_status_snapshot
+
+signed_custodian_key_status = create_custody_key_status_snapshot(
+    {
+        governance_verifier.key_id: (governance_verifier.key_revision_sha256, "active"),
+        operations_verifier.key_id: (operations_verifier.key_revision_sha256, "revoked"),
+        auditor_verifier.key_id: (auditor_verifier.key_revision_sha256, "active"),
+    },
+    key_status_authority_signer,
+    issued_at_epoch=trusted_now_epoch,
+    expires_at_epoch=trusted_now_epoch + 600,
+)
+```
+
+When both key-status arguments are supplied to `verify_custodied_stability_audit_bundle`, revoked
+revisions are removed before custody signatures are counted. The status snapshot and its
+verification are committed into the custody verification digest, which the final audit receipt
+already cross-binds. Omitting one of the two status inputs fails closed. The legacy no-status path
+remains available for retained evidence, but a protected production release should always supply
+both inputs from separately controlled configuration.
+
 The final receipt contains only evidence digests and approval counts. It does not copy
 the public URI, custodian/key identifiers, signatures, prompts, task IDs, records,
 weights, or layer scores. Retain the original publication record, lineage envelope,
@@ -91,6 +122,7 @@ This is multi-key authorization of a reference, not proof that the custodians ar
 organizationally independent. A deployment must provision keys under genuinely
 separate control planes, distribute trusted public keys out of band, and define key
 rotation and revocation policy. The module does not fetch records or keys, authenticate
-the publication service, establish trusted time, authenticate the supplied verification
-epoch, provide transparency-log consistency, prove immutable storage, or attest model
-execution. Those controls remain with the protected runner and evidence-retention system.
+the publication service, establish trusted time, authenticate the supplied verification epoch,
+prove that the single key-status authority is uncompromised, provide transparency-log consistency,
+prove immutable storage, or attest model execution. Those controls remain with the protected
+runner and evidence-retention system.
