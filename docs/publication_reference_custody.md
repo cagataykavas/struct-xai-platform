@@ -87,7 +87,8 @@ digest; changing the window invalidates every custodian approval.
 `create_custody_key_status_snapshot` produces a separately signed, short-lived view of the exact
 custodian key set. Every row binds a key ID and immutable key-revision digest to either `active` or
 `revoked`. The snapshot must cover the attestation's complete key set exactly, expire within one
-hour, and be signed by an authority key whose revision is distinct from every custodian revision.
+hour, and satisfy an externally configured authority quorum whose key revisions are distinct from
+one another and from every custodian revision.
 
 ```python
 from structxai.stability_reference_custody import create_custody_key_status_snapshot
@@ -98,18 +99,28 @@ signed_custodian_key_status = create_custody_key_status_snapshot(
         operations_verifier.key_id: (operations_verifier.key_revision_sha256, "revoked"),
         auditor_verifier.key_id: (auditor_verifier.key_revision_sha256, "active"),
     },
-    key_status_authority_signer,
+    protected_key_status_authority_signers,
+    required_authority_signatures=2,
+    signing_authority_ids=(
+        "key-status-governance",
+        "key-status-security",
+    ),
     issued_at_epoch=trusted_now_epoch,
     expires_at_epoch=trusted_now_epoch + 600,
 )
 ```
 
+The authority-policy digest commits the exact trusted authority key set and required threshold.
+Each signature covers that policy, the complete status view, and its validity window. Verification
+rejects threshold or authority-set substitution, reused authority revisions, missing quorum,
+unknown signers, and malformed or invalid signatures.
+
 When both key-status arguments are supplied to `verify_custodied_stability_audit_bundle`, revoked
-revisions are removed before custody signatures are counted. The status snapshot and its
-verification are committed into the custody verification digest, which the final audit receipt
-already cross-binds. Omitting one of the two status inputs fails closed. The legacy no-status path
-remains available for retained evidence, but a protected production release should always supply
-both inputs from separately controlled configuration.
+revisions are removed before custody signatures are counted. The status snapshot, authority policy,
+threshold, valid-authority count and status verification are committed into the custody verification
+digest, which the final audit receipt already cross-binds. Omitting one of the two status inputs
+fails closed. The legacy no-status path remains available for retained evidence, but a protected
+production release should always supply both inputs from separately controlled configuration.
 
 The final receipt contains only evidence digests and approval counts. It does not copy
 the public URI, custodian/key identifiers, signatures, prompts, task IDs, records,
@@ -123,6 +134,6 @@ organizationally independent. A deployment must provision keys under genuinely
 separate control planes, distribute trusted public keys out of band, and define key
 rotation and revocation policy. The module does not fetch records or keys, authenticate
 the publication service, establish trusted time, authenticate the supplied verification epoch,
-prove that the single key-status authority is uncompromised, provide transparency-log consistency,
+prove that a key-status authority quorum cannot collude, provide transparency-log consistency,
 prove immutable storage, or attest model execution. Those controls remain with the protected
 runner and evidence-retention system.
