@@ -127,6 +127,52 @@ the public URI, custodian/key identifiers, signatures, prompts, task IDs, record
 weights, or layer scores. Retain the original publication record, lineage envelope,
 custody attestation, base audit receipt, and final receipt together.
 
+## Retain an append-only status history
+
+`structxai.stability_status_transparency` records a status snapshot only after the existing
+authority-quorum verification succeeds. The JSONL log stores the snapshot and verification
+commitments, observation epoch, sequence, and previous-entry digest; it does not copy key IDs,
+key revisions, status rows, authority identities, or signatures.
+
+```python
+from structxai.stability_status_transparency import (
+    append_verified_custody_key_status_snapshot,
+    verify_custody_status_transparency_log,
+)
+
+checkpoint, appended = append_verified_custody_key_status_snapshot(
+    "/var/lib/struct-xai/custody-status.jsonl",
+    signed_custodian_key_status,
+    expected_custodian_key_revisions,
+    trusted_key_status_authorities,
+    log_id="production-custody-status",
+    required_authority_signatures=2,
+    verification_epoch=trusted_now_epoch,
+)
+
+# Retain this checkpoint independently from the mutable log, then require the
+# next observed log to extend it.
+current_checkpoint = verify_custody_status_transparency_log(
+    "/var/lib/struct-xai/custody-status.jsonl",
+    log_id="production-custody-status",
+    prior_checkpoint=previous_independently_retained_checkpoint,
+)
+```
+
+Append and verification take advisory file locks. Exact snapshot replay is idempotent, while
+concurrent writers serialize before assigning a sequence. Every append is flushed with `fsync`;
+the complete bounded history is revalidated before use. The log must be a regular file with mode
+`0600`, and the Linux implementation refuses a symlink at the leaf path. Run it beneath a
+deployment-owned directory that untrusted users cannot replace, and publish each returned
+checkpoint to a separately controlled, immutable retention system before authorizing the next
+release.
+
+This is a linear hash-chain consistency check, not a globally witnessed Merkle transparency
+service. Verification is O(n), with explicit 16 MiB and 100,000-entry limits. A host administrator
+who can replace both the log and every retained checkpoint can still rewrite history; an unsigned
+checkpoint is trustworthy only because it was independently retained. The module also does not
+establish trusted time or authenticate the protected runner that supplied the observation epoch.
+
 ## Trust boundary
 
 This is multi-key authorization of a reference, not proof that the custodians are
@@ -134,6 +180,6 @@ organizationally independent. A deployment must provision keys under genuinely
 separate control planes, distribute trusted public keys out of band, and define key
 rotation and revocation policy. The module does not fetch records or keys, authenticate
 the publication service, establish trusted time, authenticate the supplied verification epoch,
-prove that a key-status authority quorum cannot collude, provide transparency-log consistency,
+prove that a key-status authority quorum cannot collude, provide global transparency witnesses,
 prove immutable storage, or attest model execution. Those controls remain with the protected
 runner and evidence-retention system.

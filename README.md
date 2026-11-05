@@ -420,7 +420,9 @@ window prevents stale quorum evidence from being replayed indefinitely. A separa
 short-lived key-status snapshot can remove revoked revisions before quorum calculation while
 requiring exact key-set coverage and a distinct threshold of status-authority keys. The protected
 verifier supplies the current epoch explicitly, while the final receipt retains only hashed
-custodian metadata. See
+custodian metadata. `structxai.stability_status_transparency` can then serialize verified status
+snapshots into a privacy-reduced, append-only hash chain. An independently retained checkpoint
+detects truncation or rewritten history before a later release trusts the log. See
 [`docs/publication_reference_custody.md`](docs/publication_reference_custody.md).
 
 ## 5. Activation patching
@@ -566,6 +568,7 @@ structxai/
   stability_publication.py offline verification of externally published manifest bytes
   stability_audit_bundle.py end-to-end publication/runtime retention receipt
   stability_reference_custody.py multi-key custody quorum and cross-bound audit receipt
+  stability_status_transparency.py append-only verified custody-status commitments
   provenance.py      fingerprints and artifact validation
   experiment.py      experiment orchestration
   report.py          standalone HTML reporting
