@@ -88,8 +88,15 @@ def _key_status_snapshot(
     statuses: dict[str, str] | None = None,
     issued_at_epoch: int = ATTESTED_AT,
     expires_at_epoch: int = EXPIRES_AT,
-) -> tuple[dict[str, object], _CustodianAdapter]:
-    authority = _CustodianAdapter("key-status-authority")
+) -> tuple[dict[str, object], dict[str, _CustodianAdapter]]:
+    authorities = {
+        adapter.key_id: adapter
+        for adapter in (
+            _CustodianAdapter("key-status-authority-1"),
+            _CustodianAdapter("key-status-authority-2"),
+            _CustodianAdapter("key-status-authority-3"),
+        )
+    }
     values = statuses or {}
     snapshot = create_custody_key_status_snapshot(
         {
@@ -99,11 +106,16 @@ def _key_status_snapshot(
             )
             for adapter in custodians.values()
         },
-        authority,
+        authorities,
+        required_authority_signatures=2,
+        signing_authority_ids=(
+            "reference-custody-key-status-authority-1",
+            "reference-custody-key-status-authority-3",
+        ),
         issued_at_epoch=issued_at_epoch,
         expires_at_epoch=expires_at_epoch,
     )
-    return snapshot, authority
+    return snapshot, authorities
 
 
 def test_custodied_audit_is_deterministic_cross_bound_and_privacy_reduced(tmp_path) -> None:
@@ -359,7 +371,7 @@ def test_key_status_snapshot_filters_revoked_revisions_before_quorum(tmp_path) -
     custodians = _custodians()
     attestation = _attest(reference, custodians)
     revoked_key_id = custodians["custodian-3"].key_id
-    snapshot, authority = _key_status_snapshot(
+    snapshot, authorities = _key_status_snapshot(
         custodians,
         statuses={revoked_key_id: "revoked"},
     )
@@ -369,7 +381,7 @@ def test_key_status_snapshot_filters_revoked_revisions_before_quorum(tmp_path) -
         attestation,
         _verifiers(custodians),
         snapshot,
-        {authority.key_id: authority},
+        authorities,
         verification_epoch=VERIFICATION_EPOCH,
     )
 
@@ -378,13 +390,21 @@ def test_key_status_snapshot_filters_revoked_revisions_before_quorum(tmp_path) -
     assert verification["active_key_count"] == 2
     assert verification["revoked_key_count"] == 1
     assert len(str(verification["key_status_verification_sha256"])) == 64
+    status_verification = verify_custody_key_status_snapshot(
+        snapshot,
+        {adapter.key_id: adapter.key_revision_sha256 for adapter in custodians.values()},
+        authorities,
+        verification_epoch=VERIFICATION_EPOCH,
+    )
+    assert status_verification["required_authority_signatures"] == 2
+    assert status_verification["valid_authority_signatures"] == 2
 
 
 def test_revoked_quorum_cannot_verify_even_with_valid_custody_signatures(tmp_path) -> None:
     _manifest, _record, reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
     custodians = _custodians()
     attestation = _attest(reference, custodians)
-    snapshot, authority = _key_status_snapshot(
+    snapshot, authorities = _key_status_snapshot(
         custodians,
         statuses={
             custodians["custodian-2"].key_id: "revoked",
@@ -398,7 +418,7 @@ def test_revoked_quorum_cannot_verify_even_with_valid_custody_signatures(tmp_pat
             attestation,
             _verifiers(custodians),
             snapshot,
-            {authority.key_id: authority},
+            authorities,
             verification_epoch=VERIFICATION_EPOCH,
         )
 
@@ -406,37 +426,119 @@ def test_revoked_quorum_cannot_verify_even_with_valid_custody_signatures(tmp_pat
 def test_key_status_snapshot_rejects_tampering_coverage_and_authority_substitution(tmp_path) -> None:
     _manifest, _record, _reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
     custodians = _custodians()
-    snapshot, authority = _key_status_snapshot(custodians)
+    snapshot, authorities = _key_status_snapshot(custodians)
     tampered = copy.deepcopy(snapshot)
     tampered["statuses"][0]["status"] = "revoked"
     missing = copy.deepcopy(snapshot)
     missing["statuses"].pop()
     missing["snapshot_sha256"] = _digest(
-        {key: value for key, value in missing.items() if key not in {"snapshot_sha256", "signature"}}
+        {
+            key: value
+            for key, value in missing.items()
+            if key not in {"snapshot_sha256", "authority_signatures"}
+        }
     )
-    wrong_authority = _CustodianAdapter("wrong-key-status-authority")
+    wrong_authorities = {
+        adapter.key_id: adapter
+        for adapter in (
+            _CustodianAdapter("wrong-key-status-authority-1"),
+            _CustodianAdapter("wrong-key-status-authority-2"),
+        )
+    }
     expected_keys = {adapter.key_id: adapter.key_revision_sha256 for adapter in custodians.values()}
 
     with pytest.raises(StabilityReferenceCustodyError, match="digest does not match"):
         verify_custody_key_status_snapshot(
             tampered,
             expected_keys,
-            {authority.key_id: authority},
+            authorities,
             verification_epoch=VERIFICATION_EPOCH,
         )
     with pytest.raises(StabilityReferenceCustodyError, match="does not cover"):
         verify_custody_key_status_snapshot(
             missing,
             expected_keys,
-            {authority.key_id: authority},
+            authorities,
             verification_epoch=VERIFICATION_EPOCH,
         )
-    with pytest.raises(StabilityReferenceCustodyError, match="unavailable"):
+    with pytest.raises(StabilityReferenceCustodyError, match="policy mismatch"):
         verify_custody_key_status_snapshot(
             snapshot,
             expected_keys,
-            {wrong_authority.key_id: wrong_authority},
+            wrong_authorities,
             verification_epoch=VERIFICATION_EPOCH,
+        )
+
+
+def test_key_status_snapshot_enforces_authority_quorum_and_exact_policy(tmp_path) -> None:
+    _manifest, _record, _reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
+    custodians = _custodians()
+    snapshot, authorities = _key_status_snapshot(custodians)
+    expected_keys = {adapter.key_id: adapter.key_revision_sha256 for adapter in custodians.values()}
+    missing_signature = copy.deepcopy(snapshot)
+    missing_signature["authority_signatures"].pop()
+    tampered_signature = copy.deepcopy(snapshot)
+    signature = str(tampered_signature["authority_signatures"][0]["signature"])
+    tampered_signature["authority_signatures"][0]["signature"] = (
+        "A" if signature[0] != "A" else "B"
+    ) + signature[1:]
+
+    with pytest.raises(StabilityReferenceCustodyError, match="authority signatures are invalid"):
+        verify_custody_key_status_snapshot(
+            missing_signature,
+            expected_keys,
+            authorities,
+            verification_epoch=VERIFICATION_EPOCH,
+        )
+    with pytest.raises(StabilityReferenceCustodyError, match="authority signature is invalid"):
+        verify_custody_key_status_snapshot(
+            tampered_signature,
+            expected_keys,
+            authorities,
+            verification_epoch=VERIFICATION_EPOCH,
+        )
+    with pytest.raises(StabilityReferenceCustodyError, match="threshold mismatch"):
+        verify_custody_key_status_snapshot(
+            snapshot,
+            expected_keys,
+            authorities,
+            required_authority_signatures=3,
+            verification_epoch=VERIFICATION_EPOCH,
+        )
+
+
+def test_key_status_authority_policy_rejects_aliases_and_insufficient_signers(tmp_path) -> None:
+    _manifest, _record, _reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
+    custodians = _custodians()
+    first = _CustodianAdapter("key-status-authority-shared")
+    alias = _CustodianAdapter("key-status-authority-shared")
+    alias.key_id = "reference-custody-key-status-authority-alias"
+    authorities = {first.key_id: first, alias.key_id: alias}
+    statuses = {adapter.key_id: (adapter.key_revision_sha256, "active") for adapter in custodians.values()}
+
+    with pytest.raises(StabilityReferenceCustodyError, match="revisions must be distinct"):
+        create_custody_key_status_snapshot(
+            statuses,
+            authorities,
+            issued_at_epoch=ATTESTED_AT,
+            expires_at_epoch=EXPIRES_AT,
+        )
+    distinct_authorities = {
+        adapter.key_id: adapter
+        for adapter in (
+            _CustodianAdapter("key-status-authority-1"),
+            _CustodianAdapter("key-status-authority-2"),
+            _CustodianAdapter("key-status-authority-3"),
+        )
+    }
+    with pytest.raises(StabilityReferenceCustodyError, match="signing authority set is invalid"):
+        create_custody_key_status_snapshot(
+            statuses,
+            distinct_authorities,
+            required_authority_signatures=2,
+            signing_authority_ids=("reference-custody-key-status-authority-1",),
+            issued_at_epoch=ATTESTED_AT,
+            expires_at_epoch=EXPIRES_AT,
         )
 
 
@@ -471,7 +573,7 @@ def test_key_status_snapshot_enforces_freshness(
                 expires_at_epoch=expires_at_epoch,
             )
         return
-    snapshot, authority = _key_status_snapshot(
+    snapshot, authorities = _key_status_snapshot(
         custodians,
         issued_at_epoch=issued_at_epoch,
         expires_at_epoch=expires_at_epoch,
@@ -480,7 +582,7 @@ def test_key_status_snapshot_enforces_freshness(
         verify_custody_key_status_snapshot(
             snapshot,
             expected_keys,
-            {authority.key_id: authority},
+            authorities,
             verification_epoch=verification_epoch,
         )
 
@@ -488,12 +590,17 @@ def test_key_status_snapshot_enforces_freshness(
 def test_key_status_authority_must_be_independent_from_custodian_keys(tmp_path) -> None:
     _manifest, _record, _reference, _lineage, _lineage_adapter = _audit_fixture(tmp_path)
     custodians = _custodians()
-    authority = custodians["custodian-1"]
+    custodian_authority = custodians["custodian-1"]
+    independent_authority = _CustodianAdapter("independent-key-status-authority")
+    authorities = {
+        custodian_authority.key_id: custodian_authority,
+        independent_authority.key_id: independent_authority,
+    }
 
     with pytest.raises(StabilityReferenceCustodyError, match="must be independent"):
         create_custody_key_status_snapshot(
             {adapter.key_id: (adapter.key_revision_sha256, "active") for adapter in custodians.values()},
-            authority,
+            authorities,
             issued_at_epoch=ATTESTED_AT,
             expires_at_epoch=EXPIRES_AT,
         )
@@ -503,7 +610,7 @@ def test_custodied_audit_can_cross_bind_key_status_verification(tmp_path) -> Non
     _manifest, record, reference, lineage, lineage_adapter = _audit_fixture(tmp_path)
     custodians = _custodians()
     attestation = _attest(reference, custodians)
-    snapshot, authority = _key_status_snapshot(custodians)
+    snapshot, authorities = _key_status_snapshot(custodians)
 
     receipt = verify_custodied_stability_audit_bundle(
         reference,
@@ -515,7 +622,7 @@ def test_custodied_audit_can_cross_bind_key_status_verification(tmp_path) -> Non
         lineage_verifiers={lineage_adapter.key_id: lineage_adapter},
         verification_epoch=VERIFICATION_EPOCH,
         key_status_snapshot=snapshot,
-        key_status_authority_verifiers={authority.key_id: authority},
+        key_status_authority_verifiers=authorities,
     )
 
     assert receipt["verified"] is True

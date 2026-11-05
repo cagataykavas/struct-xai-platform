@@ -33,8 +33,9 @@ PUBLICATION_REFERENCE_CUSTODY_REVOCATION_VERIFICATION_SCHEMA = (
     "struct-xai-publication-reference-custody-revocation-verification/v1"
 )
 CUSTODIED_STABILITY_AUDIT_RECEIPT_SCHEMA = "struct-xai-custodied-stability-audit-receipt/v2"
-CUSTODY_KEY_STATUS_SNAPSHOT_SCHEMA = "struct-xai-custody-key-status-snapshot/v1"
-CUSTODY_KEY_STATUS_VERIFICATION_SCHEMA = "struct-xai-custody-key-status-verification/v1"
+CUSTODY_KEY_STATUS_SNAPSHOT_SCHEMA = "struct-xai-custody-key-status-snapshot/v2"
+CUSTODY_KEY_STATUS_VERIFICATION_SCHEMA = "struct-xai-custody-key-status-verification/v2"
+CUSTODY_KEY_STATUS_AUTHORITY_POLICY_SCHEMA = "struct-xai-custody-key-status-authority-policy/v1"
 CUSTODY_KEY_STATUS_PURPOSE = "publication-reference-custodian-key-status"
 MAX_REFERENCE_CUSTODIANS = 16
 MAX_CUSTODIED_AUDIT_RECEIPT_BYTES = 8 * 1024
@@ -92,18 +93,23 @@ _RECEIPT_DIGEST_FIELDS = _RECEIPT_FIELDS - {
     "reference_valid_approvals",
 }
 _KEY_STATUS_ROW_FIELDS = {"key_id", "key_revision_sha256", "status"}
+_KEY_STATUS_AUTHORITY_METADATA_FIELDS = {
+    "authority_algorithm",
+    "authority_key_id",
+    "authority_key_revision_sha256",
+    "signature_encoding",
+}
+_KEY_STATUS_AUTHORITY_SIGNATURE_FIELDS = _KEY_STATUS_AUTHORITY_METADATA_FIELDS | {"signature"}
 _KEY_STATUS_SNAPSHOT_FIELDS = {
     "schema_version",
     "purpose",
     "issued_at_epoch",
     "expires_at_epoch",
-    "authority_algorithm",
-    "authority_key_id",
-    "authority_key_revision_sha256",
-    "signature_encoding",
+    "required_authority_signatures",
+    "authority_policy_sha256",
+    "authority_signatures",
     "statuses",
     "snapshot_sha256",
-    "signature",
 }
 _KEY_STATUS_VALUES = {"active", "revoked"}
 
@@ -253,7 +259,7 @@ def _key_status_claims(snapshot: Mapping[str, object]) -> dict[str, object]:
     return {
         key: snapshot[key]
         for key in _KEY_STATUS_SNAPSHOT_FIELDS
-        if key not in {"signature", "snapshot_sha256"}
+        if key not in {"authority_signatures", "snapshot_sha256"}
     }
 
 
@@ -285,14 +291,89 @@ def _normalize_key_status_rows(value: object) -> list[dict[str, str]]:
     return rows
 
 
+def _key_status_authority_policy(
+    authorities: Mapping[str, ExternalEvidenceSigner | ExternalEvidenceVerifier],
+    *,
+    required_signatures: int,
+    operation: str,
+) -> tuple[str, dict[str, tuple[str, str, str]]]:
+    if not isinstance(authorities, Mapping) or not 2 <= len(authorities) <= MAX_REFERENCE_CUSTODIANS:
+        raise StabilityReferenceCustodyError("key status authority set must contain from 2 through 16 keys")
+    if type(required_signatures) is not int or not 2 <= required_signatures <= len(authorities):
+        raise StabilityReferenceCustodyError("required key status authority signatures are invalid")
+    metadata: dict[str, tuple[str, str, str]] = {}
+    revisions: set[str] = set()
+    for configured_key_id in sorted(authorities):
+        adapter = authorities[configured_key_id]
+        try:
+            algorithm, key_id, revision = _adapter_metadata(adapter)
+        except StabilityReferenceCustodyError as exc:
+            raise StabilityReferenceCustodyError("key status authority metadata is invalid") from exc
+        if configured_key_id != key_id or not callable(getattr(adapter, operation, None)):
+            raise StabilityReferenceCustodyError("key status authority metadata mismatch")
+        if revision in revisions:
+            raise StabilityReferenceCustodyError("key status authority revisions must be distinct")
+        revisions.add(revision)
+        metadata[key_id] = (algorithm, key_id, revision)
+    policy = {
+        "schema_version": CUSTODY_KEY_STATUS_AUTHORITY_POLICY_SCHEMA,
+        "required_signatures": required_signatures,
+        "authorities": [
+            {
+                "algorithm": algorithm,
+                "key_id": key_id,
+                "key_revision_sha256": revision,
+            }
+            for algorithm, key_id, revision in metadata.values()
+        ],
+    }
+    return _digest(policy), metadata
+
+
+def _normalize_key_status_authority_signatures(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not 2 <= len(value) <= MAX_REFERENCE_CUSTODIANS:
+        raise StabilityReferenceCustodyError("key status authority signatures are invalid")
+    signatures: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != _KEY_STATUS_AUTHORITY_SIGNATURE_FIELDS:
+            raise StabilityReferenceCustodyError("key status authority signature must use the exact schema")
+        algorithm = _require_identifier(item.get("authority_algorithm"), "authority_algorithm")
+        if algorithm not in EXTERNAL_SIGNATURE_ALGORITHMS:
+            raise StabilityReferenceCustodyError("key status authority algorithm is unsupported")
+        if item.get("signature_encoding") != EXTERNAL_SIGNATURE_ENCODING:
+            raise StabilityReferenceCustodyError("key status authority signature encoding is invalid")
+        signature = item.get("signature")
+        _decode_signature(signature)
+        signatures.append(
+            {
+                "authority_algorithm": algorithm,
+                "authority_key_id": _require_identifier(item.get("authority_key_id"), "authority_key_id"),
+                "authority_key_revision_sha256": _require_digest(
+                    item.get("authority_key_revision_sha256"), "authority_key_revision_sha256"
+                ),
+                "signature_encoding": EXTERNAL_SIGNATURE_ENCODING,
+                "signature": str(signature),
+            }
+        )
+    if signatures != sorted(signatures, key=lambda item: item["authority_key_id"]):
+        raise StabilityReferenceCustodyError("key status authority signatures are not canonically ordered")
+    if len({item["authority_key_id"] for item in signatures}) != len(signatures):
+        raise StabilityReferenceCustodyError("key status authority identifiers must be distinct")
+    if len({item["authority_key_revision_sha256"] for item in signatures}) != len(signatures):
+        raise StabilityReferenceCustodyError("key status authority revisions must be distinct")
+    return signatures
+
+
 def create_custody_key_status_snapshot(
     key_statuses: Mapping[str, tuple[str, str]],
-    authority: ExternalEvidenceSigner,
+    authorities: Mapping[str, ExternalEvidenceSigner],
     *,
+    required_authority_signatures: int = 2,
+    signing_authority_ids: tuple[str, ...] | None = None,
     issued_at_epoch: int,
     expires_at_epoch: int,
 ) -> dict[str, object]:
-    """Sign one short-lived active/revoked view of the exact custodian key set."""
+    """Threshold-sign one short-lived active/revoked view of the custodian keys."""
 
     if not isinstance(key_statuses, Mapping) or not 2 <= len(key_statuses) <= MAX_REFERENCE_CUSTODIANS:
         raise StabilityReferenceCustodyError("key_statuses must contain from 2 through 16 keys")
@@ -316,31 +397,53 @@ def create_custody_key_status_snapshot(
         )
     rows.sort(key=lambda item: item["key_id"])
     rows = _normalize_key_status_rows(rows)
-    algorithm, authority_key_id, authority_revision = _adapter_metadata(authority)
-    if not callable(getattr(authority, "sign", None)):
-        raise StabilityReferenceCustodyError("key status authority signer is invalid")
-    if authority_revision in {item["key_revision_sha256"] for item in rows}:
+    authority_policy_sha256, authority_metadata = _key_status_authority_policy(
+        authorities,
+        required_signatures=required_authority_signatures,
+        operation="sign",
+    )
+    custodian_revisions = {item["key_revision_sha256"] for item in rows}
+    if any(metadata[2] in custodian_revisions for metadata in authority_metadata.values()):
         raise StabilityReferenceCustodyError("key status authority must be independent")
+    selected = tuple(authority_metadata) if signing_authority_ids is None else signing_authority_ids
+    if (
+        not isinstance(selected, tuple)
+        or selected != tuple(sorted(set(selected)))
+        or not required_authority_signatures <= len(selected) <= len(authority_metadata)
+        or any(key_id not in authority_metadata for key_id in selected)
+    ):
+        raise StabilityReferenceCustodyError("key status signing authority set is invalid")
     claims: dict[str, object] = {
         "schema_version": CUSTODY_KEY_STATUS_SNAPSHOT_SCHEMA,
         "purpose": CUSTODY_KEY_STATUS_PURPOSE,
         "issued_at_epoch": issued_at,
         "expires_at_epoch": expires_at,
-        "authority_algorithm": algorithm,
-        "authority_key_id": authority_key_id,
-        "authority_key_revision_sha256": authority_revision,
-        "signature_encoding": EXTERNAL_SIGNATURE_ENCODING,
+        "required_authority_signatures": required_authority_signatures,
+        "authority_policy_sha256": authority_policy_sha256,
         "statuses": rows,
     }
     snapshot_sha256 = _digest(claims)
-    try:
-        signature = authority.sign(_canonical_json({**claims, "snapshot_sha256": snapshot_sha256}))
-    except Exception as exc:
-        raise StabilityReferenceCustodyError("key status signing failed") from exc
+    message = _canonical_json({**claims, "snapshot_sha256": snapshot_sha256})
+    authority_signatures: list[dict[str, str]] = []
+    for key_id in selected:
+        algorithm, _, revision = authority_metadata[key_id]
+        try:
+            signature = authorities[key_id].sign(message)
+        except Exception as exc:
+            raise StabilityReferenceCustodyError("key status signing failed") from exc
+        authority_signatures.append(
+            {
+                "authority_algorithm": algorithm,
+                "authority_key_id": key_id,
+                "authority_key_revision_sha256": revision,
+                "signature_encoding": EXTERNAL_SIGNATURE_ENCODING,
+                "signature": _encode_signature(signature),
+            }
+        )
     return {
         **claims,
         "snapshot_sha256": snapshot_sha256,
-        "signature": _encode_signature(signature),
+        "authority_signatures": authority_signatures,
     }
 
 
@@ -349,6 +452,7 @@ def _verify_custody_key_status_snapshot(
     expected_keys: Mapping[str, str],
     authority_verifiers: Mapping[str, ExternalEvidenceVerifier],
     *,
+    required_authority_signatures: int,
     verification_epoch: int,
     clock_skew_seconds: int,
 ) -> tuple[dict[str, object], frozenset[str]]:
@@ -358,7 +462,6 @@ def _verify_custody_key_status_snapshot(
     if (
         document.get("schema_version") != CUSTODY_KEY_STATUS_SNAPSHOT_SCHEMA
         or document.get("purpose") != CUSTODY_KEY_STATUS_PURPOSE
-        or document.get("signature_encoding") != EXTERNAL_SIGNATURE_ENCODING
     ):
         raise StabilityReferenceCustodyError("key status snapshot metadata is invalid")
     issued_at = _require_epoch(document.get("issued_at_epoch"), "issued_at_epoch")
@@ -382,44 +485,55 @@ def _verify_custody_key_status_snapshot(
     observed = {item["key_id"]: item["key_revision_sha256"] for item in rows}
     if observed != normalized_expected:
         raise StabilityReferenceCustodyError("key status snapshot does not cover the custodian set")
-    authority_metadata = (
-        _require_identifier(document.get("authority_algorithm"), "authority_algorithm"),
-        _require_identifier(document.get("authority_key_id"), "authority_key_id"),
-        _require_digest(document.get("authority_key_revision_sha256"), "authority_key_revision_sha256"),
+    claimed_required = document.get("required_authority_signatures")
+    if claimed_required != required_authority_signatures:
+        raise StabilityReferenceCustodyError("key status authority threshold mismatch")
+    expected_policy_sha256, trusted_authorities = _key_status_authority_policy(
+        authority_verifiers,
+        required_signatures=required_authority_signatures,
+        operation="verify",
     )
-    if authority_metadata[0] not in EXTERNAL_SIGNATURE_ALGORITHMS:
-        raise StabilityReferenceCustodyError("key status authority algorithm is unsupported")
-    if authority_metadata[2] in set(observed.values()):
+    if not _same(document.get("authority_policy_sha256"), expected_policy_sha256):
+        raise StabilityReferenceCustodyError("key status authority policy mismatch")
+    if any(metadata[2] in set(observed.values()) for metadata in trusted_authorities.values()):
         raise StabilityReferenceCustodyError("key status authority must be independent")
     claimed_snapshot_sha256 = document.get("snapshot_sha256")
     if not _same(claimed_snapshot_sha256, _digest(_key_status_claims(document))):
         raise StabilityReferenceCustodyError("key status snapshot digest does not match its content")
-    if not isinstance(authority_verifiers, Mapping):
-        raise StabilityReferenceCustodyError("key status authority verifiers must be a mapping")
-    verifier = authority_verifiers.get(authority_metadata[1])
-    if verifier is None:
-        raise StabilityReferenceCustodyError("key status authority is unavailable")
-    try:
-        verifier_metadata = _adapter_metadata(verifier)
-    except StabilityReferenceCustodyError as exc:
-        raise StabilityReferenceCustodyError("key status authority metadata is invalid") from exc
-    if verifier_metadata != authority_metadata or not callable(getattr(verifier, "verify", None)):
-        raise StabilityReferenceCustodyError("key status authority metadata mismatch")
-    try:
-        verified = verifier.verify(
-            _canonical_json({**_key_status_claims(document), "snapshot_sha256": claimed_snapshot_sha256}),
-            _decode_signature(document.get("signature")),
+    authority_signatures = _normalize_key_status_authority_signatures(document.get("authority_signatures"))
+    if len(authority_signatures) < required_authority_signatures:
+        raise StabilityReferenceCustodyError("key status authority quorum is not satisfied")
+    message = _canonical_json({**_key_status_claims(document), "snapshot_sha256": claimed_snapshot_sha256})
+    valid_authority_revisions: set[str] = set()
+    for item in authority_signatures:
+        key_id = item["authority_key_id"]
+        trusted_metadata = trusted_authorities.get(key_id)
+        observed_metadata = (
+            item["authority_algorithm"],
+            key_id,
+            item["authority_key_revision_sha256"],
         )
-    except Exception:  # noqa: BLE001 - provider failures are stable verification failures
-        verified = False
-    if verified is not True:
-        raise StabilityReferenceCustodyError("key status signature is invalid")
+        verifier = authority_verifiers.get(key_id)
+        if trusted_metadata != observed_metadata or verifier is None:
+            raise StabilityReferenceCustodyError("key status authority metadata mismatch")
+        try:
+            verified = verifier.verify(message, _decode_signature(item["signature"]))
+        except Exception:  # noqa: BLE001 - provider failures are stable verification failures
+            verified = False
+        if verified is not True:
+            raise StabilityReferenceCustodyError("key status authority signature is invalid")
+        valid_authority_revisions.add(item["authority_key_revision_sha256"])
+    if len(valid_authority_revisions) < required_authority_signatures:
+        raise StabilityReferenceCustodyError("key status authority quorum is not satisfied")
     active_revisions = frozenset(item["key_revision_sha256"] for item in rows if item["status"] == "active")
     verification: dict[str, object] = {
         "schema_version": CUSTODY_KEY_STATUS_VERIFICATION_SCHEMA,
         "verified": True,
         "snapshot_sha256": claimed_snapshot_sha256,
         "verified_at_epoch": verified_at,
+        "authority_policy_sha256": expected_policy_sha256,
+        "required_authority_signatures": required_authority_signatures,
+        "valid_authority_signatures": len(valid_authority_revisions),
         "active_key_count": len(active_revisions),
         "revoked_key_count": len(rows) - len(active_revisions),
         "active_key_revisions_sha256": _digest(sorted(active_revisions)),
@@ -433,6 +547,7 @@ def verify_custody_key_status_snapshot(
     expected_keys: Mapping[str, str],
     authority_verifiers: Mapping[str, ExternalEvidenceVerifier],
     *,
+    required_authority_signatures: int = 2,
     verification_epoch: int,
     clock_skew_seconds: int = MAX_CUSTODY_CLOCK_SKEW_SECONDS,
 ) -> dict[str, object]:
@@ -442,6 +557,7 @@ def verify_custody_key_status_snapshot(
         snapshot,
         expected_keys,
         authority_verifiers,
+        required_authority_signatures=required_authority_signatures,
         verification_epoch=verification_epoch,
         clock_skew_seconds=clock_skew_seconds,
     )
@@ -659,6 +775,7 @@ def verify_publication_reference_custody_with_key_status(
     key_status_snapshot: Mapping[str, object],
     key_status_authority_verifiers: Mapping[str, ExternalEvidenceVerifier],
     *,
+    required_key_status_authority_signatures: int = 2,
     verification_epoch: int,
     clock_skew_seconds: int = MAX_CUSTODY_CLOCK_SKEW_SECONDS,
 ) -> dict[str, object]:
@@ -677,6 +794,7 @@ def verify_publication_reference_custody_with_key_status(
         key_status_snapshot,
         expected_keys,
         key_status_authority_verifiers,
+        required_authority_signatures=required_key_status_authority_signatures,
         verification_epoch=verification_epoch,
         clock_skew_seconds=clock_skew_seconds,
     )
@@ -725,6 +843,7 @@ def verify_custodied_stability_audit_bundle(
     clock_skew_seconds: int = MAX_CUSTODY_CLOCK_SKEW_SECONDS,
     key_status_snapshot: Mapping[str, object] | None = None,
     key_status_authority_verifiers: Mapping[str, ExternalEvidenceVerifier] | None = None,
+    required_key_status_authority_signatures: int = 2,
 ) -> dict[str, object]:
     """Verify reference custody, publication bytes, and signed runtime lineage as one unit."""
 
@@ -744,6 +863,7 @@ def verify_custodied_stability_audit_bundle(
                 custody_verifiers,
                 key_status_snapshot,
                 key_status_authority_verifiers,
+                required_key_status_authority_signatures=required_key_status_authority_signatures,
                 verification_epoch=verification_epoch,
                 clock_skew_seconds=clock_skew_seconds,
             )
