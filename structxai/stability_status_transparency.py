@@ -198,6 +198,16 @@ def _validate_checkpoint(value: Mapping[str, object], *, log_id: str) -> dict[st
     return checkpoint
 
 
+def validate_custody_status_checkpoint(
+    value: Mapping[str, object],
+    *,
+    log_id: str,
+) -> dict[str, object]:
+    """Validate and copy one exact local transparency checkpoint."""
+
+    return _validate_checkpoint(value, log_id=_require_log_id(log_id))
+
+
 def _read_locked(descriptor: int) -> bytes:
     size = os.fstat(descriptor).st_size
     if size > MAX_STATUS_TRANSPARENCY_LOG_BYTES:
