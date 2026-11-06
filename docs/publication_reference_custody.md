@@ -169,9 +169,56 @@ release.
 
 This is a linear hash-chain consistency check, not a globally witnessed Merkle transparency
 service. Verification is O(n), with explicit 16 MiB and 100,000-entry limits. A host administrator
-who can replace both the log and every retained checkpoint can still rewrite history; an unsigned
-checkpoint is trustworthy only because it was independently retained. The module also does not
-establish trusted time or authenticate the protected runner that supplied the observation epoch.
+who can replace both the log and every retained checkpoint can still rewrite history. The module
+also does not establish trusted time or authenticate the protected runner that supplied the
+observation epoch.
+
+## Sign retained status checkpoints
+
+`structxai.stability_status_checkpoint` authenticates an exact log checkpoint before it leaves the
+protected runner. Its canonical envelope binds the log identity, tree size, head digest, checkpoint
+digest, source revision, signing epoch, signature algorithm, external key ID, and immutable key
+revision. Use a KMS/HSM-backed implementation of the existing external signer protocol, and retain
+the resulting envelope outside the mutable log host.
+
+```python
+from structxai.stability_status_checkpoint import (
+    create_signed_custody_status_checkpoint,
+    serialize_signed_custody_status_checkpoint,
+    verify_signed_custody_status_checkpoint,
+)
+
+signed_checkpoint = create_signed_custody_status_checkpoint(
+    checkpoint,
+    protected_checkpoint_signer,
+    log_id="production-custody-status",
+    source_revision=release_source_revision,
+    signed_at_epoch=trusted_now_epoch,
+)
+immutable_checkpoint_bytes = serialize_signed_custody_status_checkpoint(signed_checkpoint)
+
+# After retrieving the canonical envelope from independent retention, authenticate
+# it and prove the current local log is an extension of that retained checkpoint.
+verification = verify_signed_custody_status_checkpoint(
+    signed_checkpoint,
+    trusted_checkpoint_verifier,
+    "/var/lib/struct-xai/custody-status.jsonl",
+    expected_log_id="production-custody-status",
+    expected_source_revision=release_source_revision,
+)
+```
+
+Loading rejects oversized, noncanonical, duplicate-field, extra-field, and self-digest-invalid
+envelopes before signature verification. The verifier requires an exact out-of-band signer policy,
+authenticates the signature, checks the expected source revision, and then reuses the complete log
+validator with the signed checkpoint as its consistency boundary. Its privacy-reduced receipt
+contains evidence digests and tree sizes, not the external key ID, key revision, or signature.
+
+A valid signature proves who authorized one checkpoint; it does not prove that the retrieved
+checkpoint is the newest one. Prevent replay of an older, valid envelope by storing it in an
+object-locked versioned system or a witness service that enforces monotonic tree size. This module
+uses one external signing key and accepts a caller-supplied signing epoch; deployments requiring
+independent authorization should add signer quorum and an authenticated time source.
 
 ## Trust boundary
 
@@ -181,5 +228,5 @@ separate control planes, distribute trusted public keys out of band, and define 
 rotation and revocation policy. The module does not fetch records or keys, authenticate
 the publication service, establish trusted time, authenticate the supplied verification epoch,
 prove that a key-status authority quorum cannot collude, provide global transparency witnesses,
-prove immutable storage, or attest model execution. Those controls remain with the protected
-runner and evidence-retention system.
+prove checkpoint freshness, prove immutable storage, or attest model execution. Those controls
+remain with the protected runner and evidence-retention system.
