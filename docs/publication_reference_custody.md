@@ -220,6 +220,45 @@ object-locked versioned system or a witness service that enforces monotonic tree
 uses one external signing key and accepts a caller-supplied signing epoch; deployments requiring
 independent authorization should add signer quorum and an authenticated time source.
 
+## Retain signed checkpoints under S3 Object Lock
+
+`structxai.stability_status_checkpoint_retention` provides a narrow protected-worker adapter for
+versioned S3 retention. It authenticates the signed envelope and proves the current transparency
+log extends it before making any AWS request. It then requires bucket versioning, Object Lock, and
+all four public-access blocks, and writes the exact canonical envelope to a content-addressed key
+with conditional creation, SHA-256 checksum, KMS encryption, and COMPLIANCE retention.
+
+```python
+from structxai.stability_status_checkpoint_retention import (
+    retain_verified_status_checkpoint,
+)
+
+retention_receipt = retain_verified_status_checkpoint(
+    s3_client,
+    signed_checkpoint,
+    trusted_checkpoint_verifier,
+    "/var/lib/struct-xai/custody-status.jsonl",
+    expected_log_id="production-custody-status",
+    expected_source_revision=release_source_revision,
+    bucket="struct-xai-checkpoints-prod",
+    key_prefix="struct-xai/custody-status-checkpoints",
+    kms_key_arn=protected_kms_key_arn,
+    expected_bucket_owner=aws_account_id,
+    now_epoch=trusted_now_epoch,
+    retain_until_epoch=approved_retain_until_epoch,
+)
+```
+
+After the write, the adapter requires the returned checksum, KMS key, and version ID to match, then
+reads retention for that exact version and requires the approved COMPLIANCE deadline. Its canonical,
+self-digested receipt hashes bucket-owner and KMS identities and omits checkpoint signatures and raw
+key metadata. Provider exceptions are normalized rather than copied into evidence.
+
+This code does not create the bucket, KMS key, or IAM policy and does not claim a live AWS write.
+The deployment must deny retention bypass and deletion outside the approved retention lifecycle.
+Object Lock preserves every published version but does not identify which valid version is newest;
+consumers still need a monotonic tree-size policy or independently monitored witness.
+
 ## Trust boundary
 
 This is multi-key authorization of a reference, not proof that the custodians are
@@ -228,5 +267,5 @@ separate control planes, distribute trusted public keys out of band, and define 
 rotation and revocation policy. The module does not fetch records or keys, authenticate
 the publication service, establish trusted time, authenticate the supplied verification epoch,
 prove that a key-status authority quorum cannot collude, provide global transparency witnesses,
-prove checkpoint freshness, prove immutable storage, or attest model execution. Those controls
+prove checkpoint freshness, provision immutable storage, or attest model execution. Those controls
 remain with the protected runner and evidence-retention system.
