@@ -425,7 +425,10 @@ snapshots into a privacy-reduced, append-only hash chain. An independently retai
 detects truncation or rewritten history before a later release trusts the log.
 `structxai.stability_status_checkpoint` authenticates that checkpoint with an immutable external
 key revision, binds it to the release source revision, and proves the current log extends the signed
-boundary. Freshness still depends on object-locked storage or a monotonic witness. See
+boundary. `structxai.stability_status_checkpoint_retention` can then verify the envelope again and
+retain its exact canonical bytes as a content-addressed, KMS-encrypted S3 version under COMPLIANCE
+Object Lock, with exact-version retention readback and a privacy-reduced receipt. Freshness still
+requires a monotonic witness or consumer policy. See
 [`docs/publication_reference_custody.md`](docs/publication_reference_custody.md).
 
 ## 5. Activation patching
@@ -573,6 +576,7 @@ structxai/
   stability_reference_custody.py multi-key custody quorum and cross-bound audit receipt
   stability_status_transparency.py append-only verified custody-status commitments
   stability_status_checkpoint.py externally signed status-log consistency checkpoints
+  stability_status_checkpoint_retention.py S3 Object Lock retention for signed checkpoints
   provenance.py      fingerprints and artifact validation
   experiment.py      experiment orchestration
   report.py          standalone HTML reporting
