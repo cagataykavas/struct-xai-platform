@@ -105,6 +105,58 @@ The policy must be fixed before inspecting the sweep. A digest proves which poli
 it does not prove that the policy was independently preregistered or that a rejected run was not
 discarded.
 
+## Matched negative-control specificity gate
+
+A smooth treatment curve can still be non-specific: unrelated source activations may produce the
+same response. `structxai.patch_control_audit` compares the treatment with a prespecified set of
+matched null-source sweeps before allowing a specificity claim:
+
+```python
+from structxai.patch_control_audit import (
+    PatchControlPolicy,
+    require_patch_control_specificity,
+)
+
+specificity = require_patch_control_specificity(
+    treatment_sweep,
+    {
+        "unrelated-source-01": null_sweep_01,
+        "unrelated-source-02": null_sweep_02,
+        "corrupted-source-03": null_sweep_03,
+    },
+    dose_policy=DoseResponseAuditPolicy(
+        min_endpoint_recovery=0.20,
+        min_qualified_layers=2,
+    ),
+    control_policy=PatchControlPolicy(
+        min_controls=3,
+        min_endpoint_excess=0.15,
+        min_auc_excess=0.10,
+        max_control_endpoint_recovery=0.25,
+        max_control_normalized_auc=0.20,
+        min_specific_layers=2,
+    ),
+)
+```
+
+Every child sweep is fully revalidated and re-audited; supplied verdicts are never trusted. Each
+control must use a distinct source-input commitment and exactly match the treatment's model
+revision, target-input commitment, layer/alpha/candidate/position plan, execution policy, and layer
+set. This prevents an easier target, different candidates, or a coarser dose ladder from being
+presented as a null comparison.
+
+For each layer, the gate compares the treatment endpoint and normalized AUC with the strongest
+observed control. The treatment layer must already qualify under the ordinary dose policy, both
+control ceilings must hold, and both treatment-minus-control margins must exceed their reviewed
+minimums. The terminal policy requires a minimum number of specific layers. Evidence binds every
+child sweep and rederived audit, hashes control labels, and retains only input/evidence commitments
+and aggregate metrics—not prompts, tokens, activations, candidate labels, or raw control IDs.
+
+Controls and thresholds must be selected before observing the treatment. This is a conservative
+descriptive specificity check over a finite matched set, not a p-value or population-level null
+distribution. Poorly chosen controls, shared confounders, or off-manifold control activations can
+still mislead; acceptance does not establish necessity, sufficiency, uniqueness, or semantic truth.
+
 ## Cross-seed promotion gate
 
 `audit_cross_seed_dose_response` first revalidates every child sweep and reruns the same

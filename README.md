@@ -448,7 +448,10 @@ This is implemented with real forward hooks; it is not a static diagram standing
 The production-minded dose-response path evaluates intermediate intervention strengths, repeats
 the unpatched baseline to detect hook leakage, and can fail a promotion gate on weak endpoint
 recovery, non-monotonic behavior, large reversals, or unstable overshoot. A second gate aggregates
-matching seed runs and rejects unstable qualification rates, effect signs, endpoints, or AUCs. See
+matching seed runs and rejects unstable qualification rates, effect signs, endpoints, or AUCs.
+`structxai.patch_control_audit` adds a matched negative-control gate: the treatment must qualify and
+exceed every prespecified null source at the same target, layers, doses, candidates, and execution
+policy. See
 [`docs/activation_patch_dose_response.md`](docs/activation_patch_dose_response.md).
 
 For promotion workflows, `PatchRunSigner` now executes each sweep inside a process-serialized
@@ -554,6 +557,7 @@ structxai/
   interventions.py   controlled prompt mutations
   patching.py        activation patching
   patch_dose_response.py bounded layer/dose sweeps, per-run and cross-seed audits
+  patch_control_audit.py matched negative-control specificity gate
   patch_run_receipt.py seeded execution boundary and authenticated run provenance
   worker_seeding.py  distributed DataLoader seed plans and topology manifests
   worker_acknowledgment.py strict local-worker execution evidence
@@ -597,7 +601,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - quantitative intervention evaluation;
 - provenance validation;
 - cross-run stability metrics;
-- activation-patch isolation, dose-response and cross-seed stability policy checks;
+- activation-patch isolation, dose-response, matched-control specificity, and cross-seed checks;
 - bounded model/tokenizer manifests and in-run mutation rejection;
 - deterministic distributed-worker seed plans and authenticated topology binding;
 - fail-closed local-worker acknowledgment manifests with cross-process validation;
@@ -620,7 +624,8 @@ The repository tries to make its limitations visible:
 - first-token candidate margins are not full candidate sequence likelihoods;
 - logit-lens projections are diagnostic views, not automatically causal explanations;
 - deletion/replacement effects can be confounded by distribution shift;
-- activation patching targets one token position per run; dose sweeps evaluate a bounded layer set;
+- activation patching targets one token position per run; dose sweeps and matched controls evaluate
+  a bounded layer set and do not prove an intervention is on-manifold;
 - cross-run stability measures repeatability, not truth;
 - dataset manifests authenticate caller-canonicalized bytes, not their semantic correctness or origin;
 - a visually clean heatmap is not treated as evidence without an explicit metric and experiment identity.
