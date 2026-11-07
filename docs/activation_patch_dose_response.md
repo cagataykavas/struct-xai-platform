@@ -157,6 +157,48 @@ descriptive specificity check over a finite matched set, not a p-value or popula
 distribution. Poorly chosen controls, shared confounders, or off-manifold control activations can
 still mislead; acceptance does not establish necessity, sufficiency, uniqueness, or semantic truth.
 
+## Prespecified task-cohort gate
+
+A single task can still be selected because it produces a clean specificity result.
+`structxai.patch_control_cohort` reruns the complete treatment/control audit for every task in a
+fixed cohort and estimates the task-level specificity rate separately for every tested layer:
+
+```python
+from structxai.patch_control_cohort import (
+    PatchControlCohortPolicy,
+    PatchControlTask,
+    require_patch_control_cohort,
+)
+
+cohort = {
+    task_id: PatchControlTask(treatment=treatment, controls=matched_controls)
+    for task_id, treatment, matched_controls in prespecified_tasks
+}
+cohort_audit = require_patch_control_cohort(
+    cohort,
+    cohort_policy=PatchControlCohortPolicy(
+        min_tasks=20,
+        family_confidence=0.95,
+        min_specific_task_fraction_lower_bound=0.60,
+        min_cohort_specific_layers=2,
+    ),
+)
+```
+
+Each layer receives a one-sided Wilson lower bound for the fraction of tasks that pass the matched
+control gate. Bonferroni allocation across every layer gives simultaneous family-wise coverage
+without assuming independence between layers. The cohort passes only when the reviewed number of
+layers clears the reviewed lower-bound threshold. Exact task targets must be distinct, experiment
+and policy identities must match, task IDs are hashed, and all child sweeps are revalidated rather
+than trusting stored verdicts. The receipt binds the complete task inventory, child audits, policy,
+method, hypothesis count, bounds, and descriptive mean excesses without retaining raw task or
+control labels.
+
+Wilson coverage is approximate and treats tasks as independent Bernoulli observations. Reused or
+strongly related templates can make the bound optimistic; Bonferroni only addresses multiplicity
+across layers. The task inventory and policy must be fixed before observing outcomes. This gate does
+not prove that the cohort represents deployment traffic or that control interventions are on-manifold.
+
 ## Cross-seed promotion gate
 
 `audit_cross_seed_dose_response` first revalidates every child sweep and reruns the same
