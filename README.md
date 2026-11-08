@@ -301,3 +301,37 @@ Next research-oriented extensions include:
 ## Interview topics
 
 **logit lens · hidden states · candidate margins · sign flips · controlled interventions · activation patching · causal vs correlational explanation · explanation faithfulness · repeatability · experiment provenance · artifact validation · model hooks · reproducible research systems · FastAPI · Docker · CI.**
+
+## Verified final-layer projection parity
+
+The last hidden state returned by the supported Hugging Face decoder models is
+already final-normalized. Applying the final normalization a second time changes
+the scores and can change the candidate ordering. Earlier hidden states still
+need normalization for the diagnostic logit-lens projection. The implementation
+now preserves this distinction.
+
+Offline architecture integration tests exercise randomly initialized Qwen2 and
+GPT-2 models across three seeds, including nonuniform final-normalization weights.
+These are correctness tests, not model-quality results. To verify a pretrained
+checkpoint separately:
+
+```bash
+PYTHONPATH=. python examples/verify_hf_projection.py \
+  --revision 7ae557604adf67be50417f59c2c2f167def9a775 \
+  --output evidence/qwen_projection_parity.json
+```
+
+This compares all final-position vocabulary logits against the model's native
+forward output for five fixed Turkish prompts. It records the exact checkpoint,
+source diff digest, runtime, and both legacy and corrected errors. It does not
+measure generated-answer accuracy, intervention faithfulness, or production
+performance. Once the checkpoint is cached, set `HF_HUB_OFFLINE=1` to rerun without
+network access. See the retained JSON evidence for the measured result.
+
+The retained CPU float32 run measured a maximum absolute error of **7.471814**
+with the legacy double-normalization path and **0.0** with the corrected path
+across **759,680 final-position logits** (151,936 vocabulary entries × 5 prompts).
+Native top-1 agreement changed from **3/5 to 5/5**. These are same-forward-pass
+numerical parity results on this checkpoint/runtime, not five correct answers.
+The final projection preserves the native batched head geometry, which may use
+more temporary memory than projecting only a single vector.

@@ -29,12 +29,26 @@ def encode_candidates(tokenizer, labels: Sequence[str]) -> list[Candidate]:
 
 
 def project_hidden_states(model, hidden_states: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+    """Project Hugging Face hidden states without normalizing the final state twice.
+
+    Supported decoder families return their already final-normalized residual as
+    the last hidden state. Earlier states still need the logit-lens normalization.
+    This contract applies to HF output_hidden_states, not arbitrary hook tensors.
+    """
+    if not hidden_states:
+        raise ValueError("hidden_states must contain at least the final state")
     final_norm, lm_head = resolve_projection(model)
     projected: list[torch.Tensor] = []
     with torch.no_grad():
-        for hidden in hidden_states:
+        for index, hidden in enumerate(hidden_states):
             final_token = hidden[0, -1, :]
-            projected.append(lm_head(final_norm(final_token)).float().cpu())
+            if index == len(hidden_states) - 1:
+                # Preserve native batched head geometry as well as normalization;
+                # a vector-only GEMV can introduce avoidable float32 drift.
+                logits = lm_head(hidden)[0, -1, :]
+            else:
+                logits = lm_head(final_norm(final_token))
+            projected.append(logits.float().cpu())
     return projected
 
 

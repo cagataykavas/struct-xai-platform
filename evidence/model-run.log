@@ -1,0 +1,78 @@
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights:  76%|███████▌  | 219/290 [00:00<00:00, 2143.52it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 2301.50it/s]
+{
+  "schema": "hf-projection-parity/v1",
+  "purpose": "Final projected logits versus the same forward pass native logits; not NLP accuracy",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+  "source_revision": "d35da2b42ef5810645a9981fbee26b42b5b54dfa",
+  "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "runtime": {
+    "python": "3.12.14",
+    "torch": "2.15.0+cpu",
+    "transformers": "5.22.2",
+    "device": "cpu",
+    "dtype": "float32",
+    "threads": 2,
+    "seed": 42
+  },
+  "prompt_sha256": "d828b8647ad7558a24e2f97af8c39aa52b54a3384fb4e37a42e61a19686d3c3f",
+  "rows": [
+    {
+      "prompt": "Türkiye'nin başkenti hangi şehirdir?",
+      "tokens": 12,
+      "hidden_states": 25,
+      "vocabulary_logits": 151936,
+      "legacy_max_absolute_error": 5.428615093231201,
+      "fixed_max_absolute_error": 0.0,
+      "legacy_top1_matches_native": true,
+      "fixed_top1_matches_native": true
+    },
+    {
+      "prompt": "İki ile üç toplandığında sonuç kaçtır?",
+      "tokens": 13,
+      "hidden_states": 25,
+      "vocabulary_logits": 151936,
+      "legacy_max_absolute_error": 7.471814155578613,
+      "fixed_max_absolute_error": 0.0,
+      "legacy_top1_matches_native": true,
+      "fixed_top1_matches_native": true
+    },
+    {
+      "prompt": "Bir metindeki ana fikri belirlemek ne demektir?",
+      "tokens": 18,
+      "hidden_states": 25,
+      "vocabulary_logits": 151936,
+      "legacy_max_absolute_error": 6.717249393463135,
+      "fixed_max_absolute_error": 0.0,
+      "legacy_top1_matches_native": false,
+      "fixed_top1_matches_native": true
+    },
+    {
+      "prompt": "Su deniz seviyesinde yaklaşık kaç derecede kaynar?",
+      "tokens": 14,
+      "hidden_states": 25,
+      "vocabulary_logits": 151936,
+      "legacy_max_absolute_error": 7.143586158752441,
+      "fixed_max_absolute_error": 0.0,
+      "legacy_top1_matches_native": true,
+      "fixed_top1_matches_native": true
+    },
+    {
+      "prompt": "Gece gökyüzünde görünen doğal uydu hangisidir?",
+      "tokens": 16,
+      "hidden_states": 25,
+      "vocabulary_logits": 151936,
+      "legacy_max_absolute_error": 6.521474838256836,
+      "fixed_max_absolute_error": 0.0,
+      "legacy_top1_matches_native": false,
+      "fixed_top1_matches_native": true
+    }
+  ],
+  "parity_tolerance": {
+    "rtol": 1.3e-06,
+    "atol": 1e-05
+  },
+  "maximum_fixed_error": 0.0,
+  "maximum_legacy_error": 7.471814155578613,
+  "limitation": "Five fixed Turkish raw prompts, one checkpoint, CPU float32; no generated-answer quality or causal faithfulness claim."
+}
