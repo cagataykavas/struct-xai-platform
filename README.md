@@ -452,8 +452,9 @@ matching seed runs and rejects unstable qualification rates, effect signs, endpo
 `structxai.patch_control_audit` adds a matched negative-control gate: the treatment must qualify and
 exceed every prespecified null source at the same target, layers, doses, candidates, and execution
 policy. `structxai.patch_control_cohort` then aggregates a fixed task inventory with simultaneous
-one-sided Wilson bounds across every tested layer, preventing one convenient task or unadjusted
-per-layer rates from supporting promotion. See
+one-sided Wilson bounds across every tested layer. `structxai.patch_control_group_bootstrap` adds a
+prespecified template-family resampling gate so repeated variants of one prompt family cannot be
+counted as independent support. See
 [`docs/activation_patch_dose_response.md`](docs/activation_patch_dose_response.md).
 
 For promotion workflows, `PatchRunSigner` now executes each sweep inside a process-serialized
@@ -561,6 +562,7 @@ structxai/
   patch_dose_response.py bounded layer/dose sweeps, per-run and cross-seed audits
   patch_control_audit.py matched negative-control specificity gate
   patch_control_cohort.py prespecified multi-task specificity gate
+  patch_control_group_bootstrap.py template-group-resampled cohort uncertainty gate
   patch_run_receipt.py seeded execution boundary and authenticated run provenance
   worker_seeding.py  distributed DataLoader seed plans and topology manifests
   worker_acknowledgment.py strict local-worker execution evidence

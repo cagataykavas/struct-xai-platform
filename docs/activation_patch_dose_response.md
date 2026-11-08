@@ -199,6 +199,54 @@ strongly related templates can make the bound optimistic; Bonferroni only addres
 across layers. The task inventory and policy must be fixed before observing outcomes. This gate does
 not prove that the cohort represents deployment traffic or that control interventions are on-manifold.
 
+## Template-group bootstrap gate
+
+Related prompts often come from one template, paraphrase family, language pair, or source dataset.
+Counting those variants as independent tasks can make the task-level bound overconfident.
+`structxai.patch_control_group_bootstrap` therefore requires a prespecified task-to-group inventory
+and resamples whole groups rather than individual tasks:
+
+```python
+from structxai.patch_control_group_bootstrap import (
+    PatchControlGroupBootstrapPolicy,
+    require_patch_control_group_bootstrap,
+)
+
+grouped_audit = require_patch_control_group_bootstrap(
+    cohort,
+    task_groups={
+        task_id: template_family_id
+        for task_id, template_family_id in prespecified_task_groups
+    },
+    group_policy=PatchControlGroupBootstrapPolicy(
+        min_groups=8,
+        bootstrap_resamples=4_000,
+        bootstrap_seed=20261108,
+        family_confidence=0.95,
+        min_group_specific_fraction_lower_bound=0.60,
+        min_group_specific_layers=2,
+    ),
+)
+```
+
+For each layer, the audit first computes the specificity fraction within every group. It then
+resamples groups with replacement and averages those group fractions, giving every reviewed family
+equal weight regardless of how many closely related tasks it contains. A one-sided percentile lower
+bound is computed with Bonferroni alpha allocation across layers. The same deterministic group draws
+are reused across layers, and SHA-256 counter-mode sampling makes the receipt reproducible across
+insertion orders without relying on a process-global RNG. Work, group count, and group size are
+bounded before resampling.
+
+The grouped receipt cross-binds the ordinary cohort audit, every rederived matched-control audit,
+the complete task-to-group assignment, policy, method, work count, and layer results. Task and group
+labels are domain-separated hashes; prompts, controls, tokens, activations, and raw identifiers are
+not retained. A task-level rejection remains a rejection even if the grouped estimate passes.
+
+The percentile bootstrap is approximate and assumes groups—not tasks—are exchangeable and
+independent. Incorrect or post-hoc grouping, too few families, dataset overlap across families, and
+nonrepresentative task selection can still produce misleading bounds. This gate does not establish
+mechanism uniqueness, necessity, sufficiency, semantic correctness, or deployment validity.
+
 ## Cross-seed promotion gate
 
 `audit_cross_seed_dose_response` first revalidates every child sweep and reruns the same
