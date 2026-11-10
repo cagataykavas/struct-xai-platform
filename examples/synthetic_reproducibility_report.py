@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from structxai.consolidation import audit_decision_consolidation
 from structxai.evaluation import evaluate_interventions
 from structxai.stability import compare_runs
 
@@ -69,6 +70,7 @@ def build_report() -> dict[str, object]:
         CANDIDATES,
     )
     stability = compare_runs(base, repeat, CANDIDATES)
+    consolidation = audit_decision_consolidation(base, CANDIDATES).to_dict()
 
     return {
         "scope": "synthetic reproducibility evidence",
@@ -79,6 +81,7 @@ def build_report() -> dict[str, object]:
         "candidates": list(CANDIDATES),
         "intervention_evaluation": interventions,
         "cross_run_stability": stability,
+        "decision_consolidation": consolidation,
     }
 
 
@@ -93,6 +96,11 @@ def markdown(report: dict[str, object]) -> str:
     pairs = interventions["pairs"]
     assert isinstance(pairs, list)
 
+    consolidation = report["decision_consolidation"]
+    assert isinstance(consolidation, dict)
+    consolidation_summary = consolidation["summary"]
+    assert isinstance(consolidation_summary, dict)
+
     lines = [
         "# Struct-XAI Synthetic Reproducibility Evidence",
         "",
@@ -104,6 +112,13 @@ def markdown(report: dict[str, object]) -> str:
         f"- Mean sign agreement: `{float(summary['mean_sign_agreement_rate']):.6f}`",
         f"- Mean absolute margin difference: `{float(summary['mean_abs_margin_difference']):.6f}`",
         f"- Final pairwise winners all agree: `{bool(summary['all_final_pairwise_winners_agree'])}`",
+        "",
+        "## Decision consolidation",
+        "",
+        f"- Decision: `{consolidation['decision']}`",
+        f"- Minimum stable-layer fraction: `{float(consolidation_summary['minimum_stable_layer_fraction']):.6f}`",
+        f"- Maximum sign-flip count: `{int(consolidation_summary['maximum_sign_flip_count'])}`",
+        f"- Minimum final absolute margin: `{float(consolidation_summary['minimum_final_abs_margin']):.6f}`",
         "",
         "## Intervention sensitivity",
         "",

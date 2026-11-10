@@ -24,6 +24,7 @@ That separation is reflected directly in the codebase.
 | --- | --- |
 | Layer-wise analysis | final-position hidden-state projection, candidate-aware scores, winner/runner-up trace |
 | Decision dynamics | signed candidate margins, sign-flip detection, peak effect layer |
+| Decision consolidation | stable-layer suffix, late-flip location, churn and final-margin gate |
 | Prompt interventions | reproducible literal deletion and replacement |
 | Causal intervention | single-layer final-position activation patching with forward hooks |
 | Quantitative evaluation | mean/max margin shift, final winner change, sign-flip count, intervention sensitivity |
@@ -158,6 +159,23 @@ final pairwise winner agreement
 ```
 
 These metrics quantify **repeatability of the measured decision trace**. A high correlation is not claimed to prove causal faithfulness; faithfulness and repeatability are kept as separate concepts.
+
+### Gate whether a decision actually consolidates
+
+The offline evaluator also audits every candidate pair for when its final preference becomes a
+continuous stable suffix, how often the preference flips, where the final flip occurs, and whether
+the final margin clears a configured minimum. A machine-readable decision and stable failure codes
+can block artifacts whose apparent final answer only emerges at the last layer or remains tied.
+
+```bash
+struct-xai evaluate artifacts/turkey-capital.json --fail-consolidation
+```
+
+Exit code `3` means the artifact is structurally readable but failed the consolidation policy. The
+default policy requires the final preference to persist through at least the final quarter of
+layers, permits at most two sign flips, and rejects an effectively tied final margin. These are
+reviewable engineering thresholds, not universal neuroscience claims. Consolidation describes the
+project's pairwise first-token logit trace; it does not prove causal faithfulness or answer quality.
 
 ## 5. Activation patching
 
