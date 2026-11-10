@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from structxai.consolidation import audit_decision_consolidation
 from structxai.evaluation import evaluate_interventions
 from structxai.experiment import ExperimentSpec, compare_interventions
 from structxai.interventions import delete_literal, replace_literal
@@ -46,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("artifact", type=Path)
     evaluate.add_argument("--output", type=Path)
     evaluate.add_argument("--fail-invalid", action="store_true")
+    evaluate.add_argument("--fail-consolidation", action="store_true")
 
     stability = sub.add_parser(
         "stability",
@@ -71,8 +73,8 @@ def _write_or_print(payload: object, output: Path | None) -> None:
         print(text)
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     if args.command == "compare":
         interventions = []
@@ -116,10 +118,16 @@ def main() -> int:
                 payload.get("variants", {}),
                 candidates,
             ),
+            "decision_consolidation": audit_decision_consolidation(
+                payload["base"],
+                candidates,
+            ).to_dict(),
         }
         _write_or_print(result, args.output)
         if args.fail_invalid and not result["validation"]["valid"]:
             return 2
+        if args.fail_consolidation and result["decision_consolidation"]["decision"] != "pass":
+            return 3
         return 0
 
     output = args.output or args.artifact.with_suffix(".html")
