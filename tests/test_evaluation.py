@@ -112,3 +112,52 @@ def test_artifact_validation_detects_layer_misalignment() -> None:
 
     assert validation["valid"] is False
     assert "variant_layer_alignment_mismatch:delete_context" in validation["errors"]
+
+
+def test_artifact_validation_detects_inconsistent_decision_fields() -> None:
+    payload = _payload()
+    payload["base"]["layers"][1]["winner"] = "B"
+    payload["base"]["layers"][1]["margin"] = 999.0
+
+    validation = validate_artifact(payload)
+
+    assert validation["valid"] is False
+    assert "base_layer_1_winner_mismatch" in validation["errors"]
+    assert "base_layer_1_margin_mismatch" in validation["errors"]
+
+
+def test_artifact_validation_rejects_non_finite_candidate_scores() -> None:
+    payload = _payload()
+    payload["variants"]["delete_context"]["analysis"]["layers"][0][
+        "candidate_scores"
+    ]["A"] = float("nan")
+
+    validation = validate_artifact(payload)
+
+    assert validation["valid"] is False
+    assert (
+        "variant:delete_context_layer_0_candidate_scores_non_finite"
+        in validation["errors"]
+    )
+
+
+def test_artifact_validation_rejects_candidate_and_layer_schema_drift() -> None:
+    payload = _payload()
+    payload["base"]["candidates"][0]["label"] = "renamed"
+    payload["base"]["layers"][1]["layer"] = 4
+
+    validation = validate_artifact(payload)
+
+    assert validation["valid"] is False
+    assert "base_candidate_labels_mismatch" in validation["errors"]
+    assert "base_layer_indices_noncontiguous" in validation["errors"]
+
+
+def test_artifact_validation_handles_invalid_candidate_configuration() -> None:
+    payload = _payload()
+    payload["experiment"]["candidates"] = ["A"]
+
+    validation = validate_artifact(payload)
+
+    assert validation["valid"] is False
+    assert "base_candidate_labels_invalid" in validation["errors"]

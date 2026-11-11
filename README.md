@@ -29,7 +29,7 @@ That separation is reflected directly in the codebase.
 | Quantitative evaluation | mean/max margin shift, final winner change, sign-flip count, intervention sensitivity |
 | Repeatability | cross-run Pearson correlation, sign agreement, absolute margin drift, final-winner agreement |
 | Provenance | experiment fingerprint, prompt/candidate SHA-256, model, metric, device/dtype, runtime versions, source revision |
-| Artifact validation | prompt/model/fingerprint checks and base-vs-variant layer alignment |
+| Artifact validation | prompt/model/fingerprint checks, layer alignment, finite scores, and decision-trace invariants |
 | Outputs | JSON experiment artifacts and standalone HTML reports |
 | Interfaces | installable CLI and FastAPI experiment service |
 | Persistence | SQLite experiment metadata for the local reference service |
@@ -198,7 +198,7 @@ provenance
 └── source revision when available
 ```
 
-The provenance validator detects configuration drift, prompt/model mismatch, fingerprint mismatch, and base/variant layer misalignment. This is meant to make a report traceable to the experiment that generated it rather than treating an HTML plot as sufficient evidence by itself.
+The artifact validator detects configuration drift, prompt/model mismatch, fingerprint mismatch, and base/variant layer misalignment. It also recomputes each stored winner, runner-up, score, and margin from the candidate-score map; rejects non-finite values; and verifies contiguous layer indices and candidate labels. This prevents a structurally valid but semantically corrupted trace from being accepted as explanation evidence.
 
 ## HTML reports
 
@@ -266,6 +266,7 @@ The default CI path intentionally does **not** download a language-model checkpo
 - deletion/replacement interventions;
 - quantitative intervention evaluation;
 - provenance validation;
+- semantic decision-trace validation;
 - cross-run stability metrics;
 - HTML report generation;
 - experiment metadata lifecycle;
