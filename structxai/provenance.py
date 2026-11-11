@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import sys
@@ -74,8 +75,95 @@ def build_provenance(
     }
 
 
+def _as_finite_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _validate_decision_trace(
+    analysis: dict[str, Any],
+    candidate_labels: tuple[str, ...],
+    *,
+    context: str,
+) -> list[str]:
+    """Check that stored layer decisions agree with their candidate scores."""
+    errors: list[str] = []
+    expected_metric = "first_token_candidate_logit_margin"
+    if analysis.get("metric") != expected_metric:
+        errors.append(f"{context}_metric_mismatch")
+
+    encoded_candidates = analysis.get("candidates")
+    if not isinstance(encoded_candidates, list):
+        errors.append(f"{context}_candidates_missing")
+    else:
+        encoded_labels = [
+            row.get("label") if isinstance(row, dict) else None
+            for row in encoded_candidates
+        ]
+        if encoded_labels != list(candidate_labels):
+            errors.append(f"{context}_candidate_labels_mismatch")
+
+    layers = analysis.get("layers")
+    if not isinstance(layers, list) or not layers:
+        errors.append(f"{context}_layers_missing")
+        return errors
+    if len(candidate_labels) < 2 or len(set(candidate_labels)) != len(candidate_labels):
+        errors.append(f"{context}_candidate_labels_invalid")
+        return errors
+
+    layer_indices: list[int] = []
+    for position, row in enumerate(layers):
+        layer_context = f"{context}_layer_{position}"
+        if not isinstance(row, dict):
+            errors.append(f"{layer_context}_invalid")
+            continue
+
+        layer_index = row.get("layer")
+        if isinstance(layer_index, bool) or not isinstance(layer_index, int):
+            errors.append(f"{layer_context}_index_invalid")
+        else:
+            layer_indices.append(layer_index)
+
+        raw_scores = row.get("candidate_scores")
+        if not isinstance(raw_scores, dict) or set(raw_scores) != set(candidate_labels):
+            errors.append(f"{layer_context}_candidate_scores_mismatch")
+            continue
+
+        scores = {label: _as_finite_float(raw_scores[label]) for label in candidate_labels}
+        invalid_labels = [label for label, score in scores.items() if score is None]
+        if invalid_labels:
+            errors.append(f"{layer_context}_candidate_scores_non_finite")
+            continue
+
+        finite_scores = {label: float(scores[label]) for label in candidate_labels}
+        ranking = sorted(candidate_labels, key=finite_scores.__getitem__, reverse=True)
+        winner, runner_up = ranking[:2]
+        expected_values = {
+            "winner_score": finite_scores[winner],
+            "runner_up_score": finite_scores[runner_up],
+            "margin": finite_scores[winner] - finite_scores[runner_up],
+        }
+        if row.get("winner") != winner:
+            errors.append(f"{layer_context}_winner_mismatch")
+        if row.get("runner_up") != runner_up:
+            errors.append(f"{layer_context}_runner_up_mismatch")
+        for field, expected in expected_values.items():
+            actual = _as_finite_float(row.get(field))
+            if actual is None or not math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-9):
+                errors.append(f"{layer_context}_{field}_mismatch")
+
+    if layer_indices != list(range(len(layers))):
+        errors.append(f"{context}_layer_indices_noncontiguous")
+    return errors
+
+
 def validate_artifact(payload: dict) -> dict[str, object]:
-    """Validate configuration identity and structural consistency of an artifact."""
+    """Validate configuration identity and semantic consistency of an artifact."""
     errors: list[str] = []
     experiment = payload.get("experiment")
     provenance = payload.get("provenance")
@@ -91,6 +179,9 @@ def validate_artifact(payload: dict) -> dict[str, object]:
     if not isinstance(base, dict):
         errors.append("missing_base_analysis")
         return {"valid": False, "errors": errors}
+    if not isinstance(variants, dict):
+        errors.append("invalid_variants")
+        variants = {}
 
     try:
         name = str(experiment["name"])
@@ -119,11 +210,14 @@ def validate_artifact(payload: dict) -> dict[str, object]:
         errors.append("base_prompt_mismatch")
     if base.get("model") != model_name:
         errors.append("base_model_mismatch")
+    if provenance.get("analysis_metric") != base.get("metric"):
+        errors.append("provenance_metric_mismatch")
 
     base_layers = base.get("layers")
     if not isinstance(base_layers, list) or not base_layers:
         errors.append("base_layers_missing")
         return {"valid": not errors, "errors": errors}
+    errors.extend(_validate_decision_trace(base, candidates, context="base"))
 
     base_indices = [row.get("layer") for row in base_layers if isinstance(row, dict)]
     for variant_name, variant_payload in variants.items():
@@ -133,6 +227,13 @@ def validate_artifact(payload: dict) -> dict[str, object]:
             continue
         if analysis.get("model") != model_name:
             errors.append(f"variant_model_mismatch:{variant_name}")
+        errors.extend(
+            _validate_decision_trace(
+                analysis,
+                candidates,
+                context=f"variant:{variant_name}",
+            )
+        )
         variant_layers = analysis.get("layers")
         if not isinstance(variant_layers, list):
             errors.append(f"variant_layers_missing:{variant_name}")
