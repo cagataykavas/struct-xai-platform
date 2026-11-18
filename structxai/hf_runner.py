@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from dataclasses import asdict
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from structxai.attribution import gradient_input_margin_attribution
 from structxai.core import Candidate, find_sign_flips, layerwise_decisions, serialize_decisions
 
 
@@ -70,7 +72,51 @@ def run_layerwise(
     }
     if len(candidates) == 2:
         result["sign_flips"] = [
-            asdict(item)
-            for item in find_sign_flips(decisions, candidates[0].label, candidates[1].label)
+            asdict(item) for item in find_sign_flips(decisions, candidates[0].label, candidates[1].label)
         ]
     return result
+
+
+def run_token_margin_attribution(
+    prompt: str,
+    candidate_labels: Sequence[str],
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    device: str | None = None,
+) -> dict:
+    """Run bounded gradient×input attribution for two candidate first tokens."""
+    if len(candidate_labels) != 2:
+        raise ValueError("token attribution requires exactly two candidates")
+    resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if resolved_device == "cuda" else torch.float32
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(resolved_device)
+    model.eval()
+    encoded = tokenizer(prompt, return_tensors="pt").to(resolved_device)
+    input_ids = encoded["input_ids"][0]
+    token_embeddings = model.get_input_embeddings()(input_ids).detach().requires_grad_(True)
+    outputs = model(
+        inputs_embeds=token_embeddings.unsqueeze(0),
+        attention_mask=encoded.get("attention_mask"),
+        use_cache=False,
+    )
+    final_logits = outputs.logits[0, -1]
+    candidates = encode_candidates(tokenizer, candidate_labels)
+    report = gradient_input_margin_attribution(
+        token_embeddings,
+        final_logits[candidates[0].token_ids[0]],
+        final_logits[candidates[1].token_ids[0]],
+        [int(token_id) for token_id in input_ids.tolist()],
+        positive_candidate=candidates[0].label,
+        negative_candidate=candidates[1].label,
+    )
+    return {
+        "model": model_name,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "candidates": [asdict(candidate) for candidate in candidates],
+        "metric": report.method,
+        "device": resolved_device,
+        "dtype": str(dtype).removeprefix("torch."),
+        "token_count": len(report.tokens),
+        "attribution": report.to_dict(),
+    }

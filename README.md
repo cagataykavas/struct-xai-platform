@@ -24,6 +24,7 @@ That separation is reflected directly in the codebase.
 | --- | --- |
 | Layer-wise analysis | final-position hidden-state projection, candidate-aware scores, winner/runner-up trace |
 | Decision dynamics | signed candidate margins, sign-flip detection, peak effect layer |
+| Token attribution | bounded gradient×input attribution for a signed candidate margin |
 | Prompt interventions | reproducible literal deletion and replacement |
 | Causal intervention | single-layer final-position activation patching with forward hooks |
 | Quantitative evaluation | mean/max margin shift, final winner change, sign-flip count, intervention sensitivity |
@@ -173,6 +174,27 @@ The public patching experiment is intentionally narrow and inspectable. It captu
 
 This is implemented with real forward hooks; it is not a static diagram standing in for activation patching.
 
+## 6. Attribute a candidate margin to prompt tokens
+
+```bash
+struct-xai attribute \
+  --prompt 'Question: What is the capital of Turkey? Answer:' \
+  --candidates ' Ankara' ' Istanbul' \
+  --output artifacts/token-attribution.json
+```
+
+The command differentiates the signed first-token candidate margin with respect to each prompt-token
+embedding and reports the per-token gradient×input dot product, absolute attribution share, total
+attribution and completeness residual. The artifact includes token positions and IDs plus a prompt
+SHA-256, but does not copy prompt text into the output. Token IDs remain decodable with the model's
+tokenizer, so the artifact must still be handled as prompt-bearing data rather than anonymized
+telemetry.
+
+This is a local first-order diagnostic around the observed prompt and a zero-embedding
+linearization reference. It is **not** integrated gradients, a causal effect, a semantic
+explanation, or a completeness guarantee. Work is bounded by token count, hidden width and total
+embedding elements; malformed, disconnected or non-finite gradient evidence fails closed.
+
 ## Experiment artifact and provenance
 
 A JSON artifact contains:
@@ -245,6 +267,7 @@ structxai/
   hf_runner.py       Hugging Face model adapter
   interventions.py   controlled prompt mutations
   patching.py        activation patching
+  attribution.py     token-level gradient×input candidate-margin diagnostics
   evaluation.py      intervention-effect metrics
   stability.py       cross-run repeatability metrics
   provenance.py      fingerprints and artifact validation
@@ -282,6 +305,8 @@ The repository tries to make its limitations visible:
 - logit-lens projections are diagnostic views, not automatically causal explanations;
 - deletion/replacement effects can be confounded by distribution shift;
 - activation patching is currently limited to one layer and the final sequence position;
+- gradient×input is sensitive to embedding scale and local saturation, and its completeness
+  residual must not be hidden or treated as proof of faithful attribution;
 - cross-run stability measures repeatability, not truth;
 - a visually clean heatmap is not treated as evidence without an explicit metric and experiment identity.
 
@@ -290,7 +315,7 @@ The repository tries to make its limitations visible:
 Next research-oriented extensions include:
 
 - full candidate sequence log-probability scoring;
-- candidate-aware gradient/span attribution;
+- integrated-gradients and gradient/span attribution comparisons;
 - token × layer heatmaps;
 - activation-patching sweeps over layer × token position;
 - clean/corrupted causal tracing;

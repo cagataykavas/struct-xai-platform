@@ -6,6 +6,7 @@ from pathlib import Path
 
 from structxai.evaluation import evaluate_interventions
 from structxai.experiment import ExperimentSpec, compare_interventions
+from structxai.hf_runner import run_token_margin_attribution
 from structxai.interventions import delete_literal, replace_literal
 from structxai.patching import patch_final_position, serialize_patch
 from structxai.provenance import validate_artifact
@@ -38,6 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
     patch.add_argument("--candidates", nargs="+", required=True)
     patch.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     patch.add_argument("--device")
+
+    attribute = sub.add_parser(
+        "attribute",
+        help="attribute a signed candidate margin to prompt-token embeddings",
+    )
+    attribute.add_argument("--prompt", required=True)
+    attribute.add_argument("--candidates", nargs=2, required=True)
+    attribute.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
+    attribute.add_argument("--device")
+    attribute.add_argument("--output", type=Path)
 
     evaluate = sub.add_parser(
         "evaluate",
@@ -98,6 +109,16 @@ def main() -> int:
             args.device,
         )
         print(json.dumps(serialize_patch(result), indent=2))
+        return 0
+
+    if args.command == "attribute":
+        result = run_token_margin_attribution(
+            args.prompt,
+            args.candidates,
+            args.model,
+            args.device,
+        )
+        _write_or_print(result, args.output)
         return 0
 
     if args.command == "stability":
